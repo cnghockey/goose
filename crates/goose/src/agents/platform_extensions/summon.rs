@@ -1,10 +1,3 @@
-//! Summon Extension - Unified tooling for recipes, skills, and subagents
-//!
-//! Provides two tools:
-//! - `load`: Inject knowledge into current context or discover available sources
-//! - `delegate`: Run tasks in isolated subagents (sync or async)
-
-use crate::agents::builtin_skills;
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::mcp_client::{Error, McpClientTrait};
 use crate::agents::subagent_handler::{run_subagent_task, OnMessageCallback, SubagentRunParams};
@@ -16,17 +9,20 @@ use crate::config::{Config, GooseMode};
 use crate::providers;
 use crate::recipe::build_recipe::build_recipe_from_template;
 use crate::recipe::local_recipes::load_local_recipe_file;
-use crate::recipe::{Recipe, Settings, RECIPE_FILE_EXTENSIONS};
+use crate::recipe::{Recipe, RecipeParameter, Settings, RECIPE_FILE_EXTENSIONS};
 use crate::session::extension_data::EnabledExtensionsState;
 use crate::session::SessionType;
+use crate::sources::parse_frontmatter;
+use crate::utils::safe_truncate;
 use anyhow::Result;
 use async_trait::async_trait;
+use goose_sdk_types::custom_requests::{SourceEntry, SourceType};
 use rmcp::model::{
     CallToolResult, Content, Implementation, InitializeResult, JsonObject, ListToolsResult, Meta,
     ServerCapabilities, ServerNotification, Tool,
 };
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -39,65 +35,16 @@ use tracing::{info, warn};
 
 pub static EXTENSION_NAME: &str = "summon";
 
-#[derive(Debug, Clone)]
-pub struct Source {
-    pub name: String,
-    pub kind: SourceKind,
-    pub description: String,
-    pub path: PathBuf,
-    pub content: String,
-    pub supporting_files: Vec<PathBuf>,
-}
+const SUBAGENT_DESCRIPTION_BUDGET: usize = 160;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum SourceKind {
-    Subrecipe,
-    Recipe,
-    Skill,
-    Agent,
-    BuiltinSkill,
-}
+const TASK_LABEL_BUDGET: usize = 60;
 
-impl std::fmt::Display for SourceKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SourceKind::Subrecipe => write!(f, "subrecipe"),
-            SourceKind::Recipe => write!(f, "recipe"),
-            SourceKind::Skill => write!(f, "skill"),
-            SourceKind::Agent => write!(f, "agent"),
-            SourceKind::BuiltinSkill => write!(f, "builtin skill"),
-        }
-    }
-}
-
-impl Source {
-    /// Format the source content for loading into context
-    pub fn to_load_text(&self) -> String {
-        format!(
-            "## {} ({})\n\n{}\n\n### Content\n\n{}",
-            self.name, self.kind, self.description, self.content
-        )
-    }
-}
-
-fn kind_plural(kind: SourceKind) -> &'static str {
+fn kind_plural(kind: SourceType) -> &'static str {
     match kind {
-        SourceKind::Subrecipe => "Subrecipes",
-        SourceKind::Recipe => "Recipes",
-        SourceKind::Skill => "Skills",
-        SourceKind::Agent => "Agents",
-        SourceKind::BuiltinSkill => "Builtin Skills",
-    }
-}
-
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.chars().count() <= max_len {
-        s.to_string()
-    } else if max_len <= 3 {
-        "...".to_string()
-    } else {
-        let truncated: String = s.chars().take(max_len - 3).collect();
-        format!("{}...", truncated)
+        SourceType::Subrecipe => "Subrecipes",
+        SourceType::Recipe => "Recipes",
+        SourceType::Agent => "Agents",
+        _ => "Other",
     }
 }
 
@@ -111,6 +58,8 @@ pub struct DelegateParams {
     pub model: Option<String>,
     pub temperature: Option<f32>,
     pub max_turns: Option<usize>,
+    pub context: Option<String>,
+    pub working_dir: Option<String>,
     #[serde(default)]
     pub r#async: bool,
 }
@@ -132,12 +81,33 @@ pub struct CompletedTask {
     pub result: Result<String, String>,
     pub turns_taken: u32,
     pub duration: Duration,
+    pub completed_at: Instant,
 }
 
-#[derive(Debug, Deserialize)]
-struct SkillMetadata {
-    name: String,
-    description: String,
+fn merge_subrecipe_parameters(
+    fixed_values: Option<&HashMap<String, String>>,
+    provided_parameters: Option<&HashMap<String, serde_json::Value>>,
+) -> HashMap<String, String> {
+    let mut merged = fixed_values.cloned().unwrap_or_default();
+    if let Some(provided_parameters) = provided_parameters {
+        for (key, value) in provided_parameters {
+            let value = match value {
+                serde_json::Value::String(value) => value.clone(),
+                other => other.to_string(),
+            };
+            merged.entry(key.clone()).or_insert(value);
+        }
+    }
+    merged
+}
+
+/// Result from handle_load_task_result with structured metadata for the caller
+#[derive(Debug)]
+struct TaskLoadResult {
+    content: Vec<Content>,
+    status: &'static str,
+    turns: Option<u32>,
+    duration_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,48 +119,20 @@ struct AgentMetadata {
     model: Option<String>,
 }
 
-fn parse_frontmatter<T: for<'de> Deserialize<'de>>(content: &str) -> Option<(T, String)> {
-    let parts: Vec<&str> = content.split("---").collect();
-    if parts.len() < 3 {
-        return None;
-    }
-
-    let yaml_content = parts[1].trim();
-    let metadata: T = match serde_yaml::from_str(yaml_content) {
-        Ok(m) => m,
+fn parse_agent_content(content: &str, path: &Path) -> Option<SourceEntry> {
+    let (metadata, body): (AgentMetadata, String) = match parse_frontmatter(content) {
+        Ok(Some(parsed)) => parsed,
+        Ok(None) => return None,
         Err(e) => {
-            warn!("Failed to parse frontmatter: {}", e);
+            // Missing fields means this file has valid YAML but isn't an agent — skip silently.
+            // Only warn on actual YAML syntax errors.
+            if e.to_string().contains("missing field") {
+                return None;
+            }
+            warn!("Failed to parse agent file {}: {}", path.display(), e);
             return None;
         }
     };
-
-    let body = parts[2..].join("---").trim().to_string();
-    Some((metadata, body))
-}
-
-fn parse_skill_content(content: &str, path: PathBuf) -> Option<Source> {
-    let (metadata, body): (SkillMetadata, String) = parse_frontmatter(content)?;
-
-    if metadata.name.contains('/') {
-        warn!(
-            "Skill name '{}' contains '/' which is not allowed, skipping",
-            metadata.name
-        );
-        return None;
-    }
-
-    Some(Source {
-        name: metadata.name,
-        kind: SourceKind::Skill,
-        description: metadata.description,
-        path,
-        content: body,
-        supporting_files: Vec::new(),
-    })
-}
-
-fn parse_agent_content(content: &str, path: PathBuf) -> Option<Source> {
-    let (metadata, body): (AgentMetadata, String) = parse_frontmatter(content)?;
 
     let description = metadata.description.unwrap_or_else(|| {
         let model_info = metadata
@@ -201,110 +143,24 @@ fn parse_agent_content(content: &str, path: PathBuf) -> Option<Source> {
         format!("Agent{}", model_info)
     });
 
-    Some(Source {
+    Some(SourceEntry {
+        source_type: SourceType::Agent,
         name: metadata.name,
-        kind: SourceKind::Agent,
         description,
-        path,
         content: body,
+        path: path.to_string_lossy().into_owned(),
+        global: false,
+        writable: true,
         supporting_files: Vec::new(),
+        properties: std::collections::HashMap::new(),
     })
-}
-
-/// Scan a directory for skill subdirectories containing SKILL.md files.
-/// Returns discovered skills, skipping any whose names are already in `seen`.
-fn scan_skills_from_dir(dir: &Path, seen: &mut std::collections::HashSet<String>) -> Vec<Source> {
-    let mut sources = Vec::new();
-    let mut visited_dirs = HashSet::new();
-    for skill_file in collect_skill_files(dir, &mut visited_dirs) {
-        let Some(skill_dir) = skill_file.parent() else {
-            continue;
-        };
-        let content = match std::fs::read_to_string(&skill_file) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Failed to read skill file {}: {}", skill_file.display(), e);
-                continue;
-            }
-        };
-
-        if let Some(mut source) = parse_skill_content(&content, skill_dir.to_path_buf()) {
-            if !seen.contains(&source.name) {
-                let mut visited_support_dirs = HashSet::new();
-                source.supporting_files =
-                    find_supporting_files(skill_dir, &mut visited_support_dirs);
-                seen.insert(source.name.clone());
-                sources.push(source);
-            }
-        }
-    }
-    sources
-}
-
-fn collect_skill_files(dir: &Path, visited_dirs: &mut HashSet<PathBuf>) -> Vec<PathBuf> {
-    let mut skill_files = Vec::new();
-
-    walk_files_recursively(
-        dir,
-        visited_dirs,
-        &mut |path| !should_skip_skill_walk_dir(path),
-        &mut |path| {
-            if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
-                skill_files.push(path.to_path_buf());
-            }
-        },
-    );
-
-    skill_files
-}
-
-fn should_skip_skill_walk_dir(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(|name| name.to_str()),
-        Some(".git") | Some(".hg") | Some(".svn")
-    )
-}
-
-fn walk_files_recursively<F, G>(
-    dir: &Path,
-    visited_dirs: &mut HashSet<PathBuf>,
-    should_descend: &mut G,
-    visit_file: &mut F,
-) where
-    F: FnMut(&Path),
-    G: FnMut(&Path) -> bool,
-{
-    let canonical_dir = match std::fs::canonicalize(dir) {
-        Ok(path) => path,
-        Err(_) => return,
-    };
-
-    if !visited_dirs.insert(canonical_dir) {
-        return;
-    }
-
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-
-        if path.is_dir() {
-            if should_descend(&path) {
-                walk_files_recursively(&path, visited_dirs, should_descend, visit_file);
-            }
-        } else if path.is_file() {
-            visit_file(&path);
-        }
-    }
 }
 
 fn scan_recipes_from_dir(
     dir: &Path,
-    kind: SourceKind,
-    sources: &mut Vec<Source>,
+    kind: SourceType,
+    suppress_config_warnings: bool,
+    sources: &mut Vec<SourceEntry>,
     seen: &mut std::collections::HashSet<String>,
 ) {
     let entries = match std::fs::read_dir(dir) {
@@ -336,16 +192,26 @@ fn scan_recipes_from_dir(
         match Recipe::from_file_path(&path) {
             Ok(recipe) => {
                 seen.insert(name.clone());
-                sources.push(Source {
+                sources.push(SourceEntry {
+                    source_type: kind,
                     name,
-                    kind,
                     description: recipe.description.clone(),
-                    path: path.clone(),
                     content: recipe.instructions.clone().unwrap_or_default(),
+                    path: path.to_string_lossy().into_owned(),
+                    global: false,
+                    writable: true,
                     supporting_files: Vec::new(),
+                    properties: std::collections::HashMap::new(),
                 });
             }
             Err(e) => {
+                // The working directory commonly contains project config like package.json
+                // and tsconfig.json, which parse as valid JSON but lack Recipe fields. In that
+                // case treat them as "not a recipe" rather than warning. Dedicated recipe
+                // directories still warn so a real recipe with a typo is not silently dropped.
+                if suppress_config_warnings && e.to_string().contains("missing field") {
+                    continue;
+                }
                 warn!("Failed to parse recipe {}: {}", path.display(), e);
             }
         }
@@ -354,7 +220,7 @@ fn scan_recipes_from_dir(
 
 fn scan_agents_from_dir(
     dir: &Path,
-    sources: &mut Vec<Source>,
+    sources: &mut Vec<SourceEntry>,
     seen: &mut std::collections::HashSet<String>,
 ) {
     let entries = match std::fs::read_dir(dir) {
@@ -381,7 +247,7 @@ fn scan_agents_from_dir(
             }
         };
 
-        if let Some(source) = parse_agent_content(&content, path) {
+        if let Some(source) = parse_agent_content(&content, &path) {
             if !seen.contains(&source.name) {
                 seen.insert(source.name.clone());
                 sources.push(source);
@@ -390,25 +256,14 @@ fn scan_agents_from_dir(
     }
 }
 
-/// Returns all discovered sources (skills, recipes, agents) from the given working directory.
-/// If no directory is provided, falls back to `std::env::current_dir()`.
-/// This is useful for listing what's available without needing a full SummonClient instance.
-pub fn list_installed_sources(working_dir: Option<&Path>) -> Vec<Source> {
-    let dir = working_dir
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    discover_filesystem_sources(&dir)
-}
-
-fn discover_filesystem_sources(working_dir: &Path) -> Vec<Source> {
-    let mut sources: Vec<Source> = Vec::new();
+pub fn discover_filesystem_sources(working_dir: &Path) -> Vec<SourceEntry> {
+    let mut sources: Vec<SourceEntry> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let home = dirs::home_dir();
     let config = Paths::config_dir();
 
     let local_recipe_dirs: Vec<PathBuf> = vec![
-        working_dir.to_path_buf(),
         working_dir.join(".goose/recipes"),
         working_dir.join(".agents/recipes"),
     ];
@@ -422,6 +277,7 @@ fn discover_filesystem_sources(working_dir: &Path) -> Vec<Source> {
         })
         .chain(
             [
+                home.as_ref().map(|h| h.join(".goose/recipes")),
                 Some(config.join("recipes")),
                 home.as_ref().map(|h| h.join(".agents/recipes")),
             ]
@@ -430,22 +286,6 @@ fn discover_filesystem_sources(working_dir: &Path) -> Vec<Source> {
         )
         .collect();
 
-    let local_skill_dirs: Vec<PathBuf> = vec![
-        working_dir.join(".goose/skills"),
-        working_dir.join(".claude/skills"),
-        working_dir.join(".agents/skills"),
-    ];
-
-    let global_skill_dirs: Vec<PathBuf> = [
-        home.as_ref().map(|h| h.join(".agents/skills")),
-        Some(config.join("skills")),
-        home.as_ref().map(|h| h.join(".claude/skills")),
-        home.as_ref().map(|h| h.join(".config/agents/skills")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-
     let local_agent_dirs: Vec<PathBuf> = vec![
         working_dir.join(".goose/agents"),
         working_dir.join(".claude/agents"),
@@ -453,6 +293,7 @@ fn discover_filesystem_sources(working_dir: &Path) -> Vec<Source> {
     ];
 
     let global_agent_dirs: Vec<PathBuf> = [
+        home.as_ref().map(|h| h.join(".goose/agents")),
         home.as_ref().map(|h| h.join(".agents/agents")),
         Some(config.join("agents")),
         home.as_ref().map(|h| h.join(".claude/agents")),
@@ -461,12 +302,16 @@ fn discover_filesystem_sources(working_dir: &Path) -> Vec<Source> {
     .flatten()
     .collect();
 
-    for dir in local_recipe_dirs {
-        scan_recipes_from_dir(&dir, SourceKind::Recipe, &mut sources, &mut seen);
-    }
+    scan_recipes_from_dir(
+        working_dir,
+        SourceType::Recipe,
+        true,
+        &mut sources,
+        &mut seen,
+    );
 
-    for dir in local_skill_dirs {
-        sources.extend(scan_skills_from_dir(&dir, &mut seen));
+    for dir in local_recipe_dirs {
+        scan_recipes_from_dir(&dir, SourceType::Recipe, false, &mut sources, &mut seen);
     }
 
     for dir in local_agent_dirs {
@@ -474,53 +319,115 @@ fn discover_filesystem_sources(working_dir: &Path) -> Vec<Source> {
     }
 
     for dir in global_recipe_dirs {
-        scan_recipes_from_dir(&dir, SourceKind::Recipe, &mut sources, &mut seen);
-    }
-
-    for dir in global_skill_dirs {
-        sources.extend(scan_skills_from_dir(&dir, &mut seen));
+        scan_recipes_from_dir(&dir, SourceType::Recipe, false, &mut sources, &mut seen);
     }
 
     for dir in global_agent_dirs {
         scan_agents_from_dir(&dir, &mut sources, &mut seen);
     }
 
-    for content in builtin_skills::get_all() {
-        if let Some(source) = parse_skill_content(content, PathBuf::new()) {
-            if !seen.contains(&source.name) {
-                seen.insert(source.name.clone());
-                sources.push(Source {
-                    kind: SourceKind::BuiltinSkill,
-                    ..source
+    sources
+}
+
+fn build_instructions_with_context(context: &str, instructions: &str) -> String {
+    let mut result = format!("# Reference Context\n\n{}", context);
+    if !instructions.is_empty() {
+        result.push_str(&format!("\n\n# Task Instructions\n\n{}", instructions));
+    }
+    result
+}
+
+fn build_subagent_instructions(session: Option<&crate::session::Session>) -> String {
+    let Some(session) = session else {
+        return String::new();
+    };
+
+    // filter the sources down to what we want even though currently that is what we get
+    let mut sources: Vec<SourceEntry> = discover_filesystem_sources(&session.working_dir)
+        .into_iter()
+        .filter(|s| {
+            matches!(
+                s.source_type,
+                SourceType::Agent | SourceType::Recipe | SourceType::Subrecipe
+            )
+        })
+        .collect();
+
+    // If the session is started from a recipe, also use the subrecipes for
+    // that recipe as delegate targets
+    if let Some(recipe) = session.recipe.as_ref() {
+        if let Some(subs) = recipe.sub_recipes.as_ref() {
+            let mut seen: std::collections::HashSet<String> =
+                sources.iter().map(|s| s.name.clone()).collect();
+            for sr in subs {
+                if !seen.insert(sr.name.clone()) {
+                    continue;
+                }
+                sources.push(SourceEntry {
+                    source_type: SourceType::Subrecipe,
+                    name: sr.name.clone(),
+                    description: sr.description.clone().unwrap_or_default(),
+                    content: String::new(),
+                    path: sr.path.clone(),
+                    global: false,
+                    writable: false,
+                    supporting_files: Vec::new(),
+                    properties: std::collections::HashMap::new(),
                 });
             }
         }
     }
 
-    sources
-}
+    if sources.is_empty() {
+        return String::new();
+    }
 
-/// Collect all files in a skill directory recursively, excluding SKILL.md itself.
-fn find_supporting_files(directory: &Path, visited_dirs: &mut HashSet<PathBuf>) -> Vec<PathBuf> {
-    let mut files = Vec::new();
+    sources.sort_by(|a, b| (&a.source_type, &a.name).cmp(&(&b.source_type, &b.name)));
+    let subagents: Vec<&SourceEntry> = sources.iter().collect();
 
-    walk_files_recursively(
-        directory,
-        visited_dirs,
-        &mut |path| !should_skip_skill_walk_dir(path) && !path.join("SKILL.md").is_file(),
-        &mut |path| {
-            let is_skill_md = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n == "SKILL.md")
-                .unwrap_or(false);
-            if !is_skill_md {
-                files.push(path.to_path_buf());
-            }
-        },
+    let names = subagents
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut out = String::new();
+    out.push_str(
+        "\n\nThe following named subagents are available in this session and \
+         can be invoked through the `delegate` tool (run as a subagent) or \
+         the `load` tool (read their instructions into your own context):\n",
     );
 
-    files
+    let mut current_kind: Option<SourceType> = None;
+    for s in &subagents {
+        if current_kind != Some(s.source_type) {
+            out.push_str(&format!("\n{}:", kind_plural(s.source_type)));
+            current_kind = Some(s.source_type);
+        }
+        out.push_str(&format!(
+            "\n• {} — {}",
+            s.name,
+            safe_truncate(&s.description, SUBAGENT_DESCRIPTION_BUDGET)
+        ));
+    }
+
+    out.push_str(&format!(
+        "\n\nWhen to call a subagent (one of [{names}]):\n\
+         • `@<name>` in the user's message — always call that subagent.\n\
+         • The user mentions a subagent by name without `@` — infer from \
+         context whether they want it invoked, and if so, call it.\n\
+         • The user's request strongly matches a subagent's description — \
+         call it.\n\n\
+         Calling a subagent normally means `delegate(source: \"<name>\", \
+         instructions: ...)`, which runs it as an isolated subagent and \
+         returns its result. Use `load(source: \"<name>\")` instead if you \
+         only want to read the subagent's instructions into your own \
+         context. For long-running work, pass `async: true` to `delegate` — \
+         it returns a task id immediately, and you collect the result later \
+         with `load(source: \"<task_id>\")`, which waits for completion.",
+    ));
+
+    out
 }
 
 fn round_duration(d: Duration) -> String {
@@ -546,6 +453,13 @@ fn max_background_tasks() -> usize {
         .unwrap_or(5)
 }
 
+fn completed_task_ttl() -> Duration {
+    let secs = Config::global()
+        .get_param::<u64>("GOOSE_COMPLETED_TASK_TTL_SECS")
+        .unwrap_or(600);
+    Duration::from_secs(secs)
+}
+
 fn is_session_id(s: &str) -> bool {
     let parts: Vec<&str> = s.split('_').collect();
     parts.len() == 2 && parts[0].len() == 8 && parts[0].chars().all(|c| c.is_ascii_digit())
@@ -554,7 +468,7 @@ fn is_session_id(s: &str) -> bool {
 pub struct SummonClient {
     info: InitializeResult,
     context: PlatformExtensionContext,
-    source_cache: Mutex<Option<(Instant, PathBuf, Vec<Source>)>>,
+    source_cache: Mutex<Option<(Instant, PathBuf, Vec<SourceEntry>)>>,
     background_tasks: Mutex<HashMap<String, BackgroundTask>>,
     completed_tasks: Mutex<HashMap<String, CompletedTask>>,
     notification_subscribers: Arc<Mutex<Vec<mpsc::Sender<ServerNotification>>>>,
@@ -573,31 +487,8 @@ impl Drop for SummonClient {
 
 impl SummonClient {
     pub fn new(context: PlatformExtensionContext) -> Result<Self> {
-        let instructions = if let Some(session) = &context.session {
-            let mut instructions = "".to_string();
-            let sources = discover_filesystem_sources(&session.working_dir);
-
-            let mut skills: Vec<&Source> = sources
-                .iter()
-                .filter(|s| s.kind == SourceKind::Skill || s.kind == SourceKind::BuiltinSkill)
-                .collect();
-
-            skills.sort_by(|a, b| (&a.name, &a.path).cmp(&(&b.name, &b.path)));
-
-            if !skills.is_empty() {
-                instructions.push_str("\n\nYou have these skills at your disposal, when it is clear they can help you solve a problem or you are asked to use them:");
-                for skill in &skills {
-                    instructions.push_str(&format!("\n• {} - {}", skill.name, skill.description));
-                }
-            }
-            Some(instructions)
-        } else {
-            None
-        };
-
         let info = InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(EXTENSION_NAME, "1.0.0").with_title("Summon"))
-            .with_instructions(instructions.unwrap_or_default());
+            .with_server_info(Implementation::new(EXTENSION_NAME, "1.0.0").with_title("Summon"));
 
         Ok(Self {
             info,
@@ -607,6 +498,36 @@ impl SummonClient {
             completed_tasks: Mutex::new(HashMap::new()),
             notification_subscribers: Arc::new(Mutex::new(Vec::new())),
         })
+    }
+
+    async fn create_subagent_session(
+        &self,
+        task_config: &TaskConfig,
+        name: String,
+    ) -> Result<crate::session::Session, String> {
+        let session = self
+            .context
+            .session_manager
+            .create_session(
+                task_config.parent_working_dir.clone(),
+                name,
+                SessionType::SubAgent,
+                GooseMode::Auto,
+            )
+            .await
+            .map_err(|e| format!("Failed to create subagent session: {}", e))?;
+
+        if !task_config.parent_session_id.is_empty() {
+            self.context
+                .session_manager
+                .update(&session.id)
+                .parent_session_id(Some(task_config.parent_session_id.clone()))
+                .apply()
+                .await
+                .map_err(|e| format!("Failed to link subagent to parent session: {}", e))?;
+        }
+
+        Ok(session)
     }
 
     fn spawn_notification_bridge(
@@ -643,6 +564,11 @@ impl SummonClient {
                     "type": "boolean",
                     "default": false,
                     "description": "For running background tasks: cancel and return output."
+                },
+                "peek": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "For running background tasks: check progress without blocking. Returns turn count, idle time, and recent tool activity."
                 }
             }
         });
@@ -650,14 +576,16 @@ impl SummonClient {
         Tool::new(
             "load",
             "Load knowledge into your current context or discover available sources.\n\n\
-             Call with no arguments to list all available sources (subrecipes, recipes, skills, agents).\n\
+             Call with no arguments to list all available sources (subrecipes, recipes, agents).\n\
              Call with a source name to load its content into your context.\n\
              For background tasks: load(source: \"task_id\") waits for the task and returns the result.\n\
-             To cancel a running task: load(source: \"task_id\", cancel: true) stops and returns output.\n\n\
+             To cancel a running task: load(source: \"task_id\", cancel: true) stops and returns output.\n\
+             To check progress: load(source: \"task_id\", peek: true) returns status without blocking.\n\n\
              Examples:\n\
              - load() → Lists available sources\n\
-             - load(source: \"rust-patterns\") → Loads the rust-patterns skill\n\
-             - load(source: \"20260219_1\") → Waits for background task, then returns result"
+             - load(source: \"deploy\") → Loads the deploy recipe\n\
+             - load(source: \"20260219_1\") → Waits for background task, then returns result\n\
+             - load(source: \"20260219_1\", peek: true) → Check task progress without waiting"
                 .to_string(),
             schema.as_object().unwrap().clone(),
         )
@@ -673,7 +601,7 @@ impl SummonClient {
                 },
                 "source": {
                     "type": "string",
-                    "description": "Name of a recipe, skill, or agent to run."
+                    "description": "Name of a recipe or agent to run."
                 },
                 "parameters": {
                     "type": "object",
@@ -702,6 +630,14 @@ impl SummonClient {
                     "minimum": 1,
                     "description": "Maximum turns for this delegate. Overrides recipe settings.max_turns and GOOSE_SUBAGENT_MAX_TURNS."
                 },
+                "context": {
+                    "type": "string",
+                    "description": "Reference context to inject into the delegate's system prompt. Use for background information, file contents, or constraints the delegate needs but that aren't part of the task instructions."
+                },
+                "working_dir": {
+                    "type": "string",
+                    "description": "Working directory for the delegate. Must be within the parent session's working directory. Defaults to the parent's working directory."
+                },
                 "async": {
                     "type": "boolean",
                     "default": false,
@@ -715,8 +651,8 @@ impl SummonClient {
             "Delegate a task to a subagent that runs independently with its own context.\n\n\
              Modes:\n\
              1. Ad-hoc: Provide `instructions` for a custom task\n\
-             2. Source-based: Provide `source` name to run a subrecipe, recipe, skill, or agent\n\
-             3. Combined: Pair a source with a task (e.g., source: \"rust-patterns\", instructions: \"review auth.rs\")\n\n\
+             2. Source-based: Provide `source` name to run a subrecipe, recipe, or agent\n\
+             3. Combined: Pair a source with a task (e.g., source: \"deploy\", instructions: \"deploy to staging\")\n\n\
              Effective Delegation:\n\
              - Delegates know only instructions + source content\n\
              - Delegates cannot coordinate. Same-file work = conflicts.\n\
@@ -739,11 +675,11 @@ impl SummonClient {
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
     }
 
-    async fn get_sources(&self, session_id: &str, working_dir: &Path) -> Vec<Source> {
+    async fn get_sources(&self, session_id: &str, working_dir: &Path) -> Vec<SourceEntry> {
         let fs_sources = self.get_filesystem_sources(working_dir).await;
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut sources: Vec<Source> = Vec::new();
+        let mut sources: Vec<SourceEntry> = Vec::new();
 
         self.add_subrecipes(session_id, &mut sources, &mut seen)
             .await;
@@ -755,11 +691,11 @@ impl SummonClient {
             }
         }
 
-        sources.sort_by(|a, b| (&a.kind, &a.name).cmp(&(&b.kind, &b.name)));
+        sources.sort_by(|a, b| (&a.source_type, &a.name).cmp(&(&b.source_type, &b.name)));
         sources
     }
 
-    async fn get_filesystem_sources(&self, working_dir: &Path) -> Vec<Source> {
+    async fn get_filesystem_sources(&self, working_dir: &Path) -> Vec<SourceEntry> {
         let mut cache = self.source_cache.lock().await;
         if let Some((cached_at, cached_dir, sources)) = cache.as_ref() {
             if cached_dir == working_dir && cached_at.elapsed() < Duration::from_secs(60) {
@@ -776,55 +712,14 @@ impl SummonClient {
         session_id: &str,
         name: &str,
         working_dir: &Path,
-    ) -> Result<Option<Source>, String> {
+    ) -> Result<Option<SourceEntry>, String> {
         let sources = self.get_sources(session_id, working_dir).await;
 
         if let Some(mut source) = sources.iter().find(|s| s.name == name).cloned() {
-            if source.kind == SourceKind::Subrecipe && source.content.is_empty() {
+            if source.source_type == SourceType::Subrecipe && source.content.is_empty() {
                 source.content = self.load_subrecipe_content(session_id, &source.name).await;
             }
             return Ok(Some(source));
-        }
-
-        if let Some((skill_name, raw_relative_path)) = name.split_once('/') {
-            let relative_path = raw_relative_path.replace('\\', "/");
-            if let Some(skill) = sources.iter().find(|s| {
-                s.name == skill_name
-                    && matches!(s.kind, SourceKind::Skill | SourceKind::BuiltinSkill)
-            }) {
-                let canonical_skill_dir = skill
-                    .path
-                    .canonicalize()
-                    .unwrap_or_else(|_| skill.path.clone());
-
-                for file_path in &skill.supporting_files {
-                    if let Ok(rel) = file_path.strip_prefix(&skill.path) {
-                        let rel_normalized = rel.to_string_lossy().replace('\\', "/");
-                        if rel_normalized == relative_path {
-                            let canonical_file = file_path
-                                .canonicalize()
-                                .map_err(|e| format!("Failed to resolve '{}': {}", name, e))?;
-                            if !canonical_file.starts_with(&canonical_skill_dir) {
-                                return Err(format!(
-                                    "Refusing to load '{}': file resolves outside the skill directory",
-                                    name
-                                ));
-                            }
-                            return match std::fs::read_to_string(&canonical_file) {
-                                Ok(content) => Ok(Some(Source {
-                                    name: name.to_string(),
-                                    kind: SourceKind::Skill,
-                                    description: format!("Supporting file for {}", skill_name),
-                                    path: file_path.clone(),
-                                    content,
-                                    supporting_files: vec![],
-                                })),
-                                Err(e) => Err(format!("Failed to read '{}': {}", name, e)),
-                            };
-                        }
-                    }
-                }
-            }
         }
 
         Ok(None)
@@ -853,21 +748,30 @@ impl SummonClient {
 
         match load_local_recipe_file(&sr.path) {
             Ok(recipe_file) => match Recipe::from_content(&recipe_file.content) {
-                Ok(recipe) => recipe.instructions.unwrap_or_default(),
+                Ok(recipe) => {
+                    let mut content = recipe.instructions.unwrap_or_default();
+                    if let Some(params) = &recipe.parameters {
+                        if !params.is_empty() {
+                            content.push_str("\n\n");
+                            content.push_str(&Self::format_parameters(params));
+                        }
+                    }
+                    content
+                }
                 Err(_) => recipe_file.content,
             },
             Err(_) => String::new(),
         }
     }
 
-    fn discover_filesystem_sources(&self, working_dir: &Path) -> Vec<Source> {
+    fn discover_filesystem_sources(&self, working_dir: &Path) -> Vec<SourceEntry> {
         discover_filesystem_sources(working_dir)
     }
 
     async fn add_subrecipes(
         &self,
         session_id: &str,
-        sources: &mut Vec<Source>,
+        sources: &mut Vec<SourceEntry>,
         seen: &mut std::collections::HashSet<String>,
     ) {
         let session = match self
@@ -893,13 +797,16 @@ impl SummonClient {
 
             let description = self.build_subrecipe_description(sr).await;
 
-            sources.push(Source {
+            sources.push(SourceEntry {
+                source_type: SourceType::Subrecipe,
                 name: sr.name.clone(),
-                kind: SourceKind::Subrecipe,
                 description,
-                path: PathBuf::from(&sr.path),
                 content: String::new(),
+                path: sr.path.clone(),
+                global: false,
+                writable: true,
                 supporting_files: Vec::new(),
+                properties: std::collections::HashMap::new(),
             });
         }
     }
@@ -914,10 +821,8 @@ impl SummonClient {
                 let mut desc = recipe.description.clone();
 
                 if let Some(params) = &recipe.parameters {
-                    let param_names: Vec<&str> = params.iter().map(|p| p.key.as_str()).collect();
-                    if !param_names.is_empty() {
-                        let params_str = param_names.join(", ");
-                        desc = format!("{} (params: {})", desc, params_str);
+                    if !params.is_empty() {
+                        desc = format!("{}\n{}", desc, Self::format_parameters(params));
                     }
                 }
 
@@ -926,6 +831,24 @@ impl SummonClient {
         }
 
         format!("Subrecipe from {}", sr.path)
+    }
+
+    fn format_parameters(params: &[RecipeParameter]) -> String {
+        let mut out = String::from("Parameters:");
+        for p in params {
+            let mut detail = format!("\n  - {} ({}, {})", p.key, p.input_type, p.requirement);
+            if let Some(default) = &p.default {
+                detail.push_str(&format!(", default: \"{}\"", default));
+            }
+            if let Some(options) = &p.options {
+                if !options.is_empty() {
+                    detail.push_str(&format!(", options: [{}]", options.join(", ")));
+                }
+            }
+            detail.push_str(&format!(": {}", p.description));
+            out.push_str(&detail);
+        }
+        out
     }
 
     async fn handle_load(
@@ -946,6 +869,12 @@ impl SummonClient {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        let peek = arguments
+            .as_ref()
+            .and_then(|args| args.get("peek"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         let working_dir = self.get_working_dir(session_id).await;
 
         if source_name.is_none() {
@@ -958,13 +887,29 @@ impl SummonClient {
         let name = source_name.unwrap();
 
         if is_session_id(name) {
-            let content = self.handle_load_task_result(name, cancel).await?;
+            let task_result = self.handle_load_task_result(name, cancel, peek).await?;
             let mut meta = Meta::new();
             meta.0.insert(
                 "subagent_session_id".to_string(),
                 serde_json::Value::String(name.to_string()),
             );
-            return Ok(CallToolResult::success(content).with_meta(Some(meta)));
+            meta.0.insert(
+                "task_status".to_string(),
+                serde_json::Value::String(task_result.status.to_string()),
+            );
+            if let Some(turns) = task_result.turns {
+                meta.0.insert(
+                    "turns_taken".to_string(),
+                    serde_json::Value::Number(turns.into()),
+                );
+            }
+            if let Some(secs) = task_result.duration_secs {
+                meta.0.insert(
+                    "duration_secs".to_string(),
+                    serde_json::Value::Number(secs.into()),
+                );
+            }
+            return Ok(CallToolResult::success(task_result.content).with_meta(Some(meta)));
         }
 
         self.handle_load_source(session_id, name, &working_dir)
@@ -976,39 +921,103 @@ impl SummonClient {
         &self,
         task_id: &str,
         cancel: bool,
-    ) -> Result<Vec<Content>, String> {
+        peek: bool,
+    ) -> Result<TaskLoadResult, String> {
         let mut completed = self.completed_tasks.lock().await;
 
-        if let Some(task) = completed.remove(task_id) {
-            let status = if task.result.is_ok() {
-                "✓ Completed"
-            } else {
-                "✗ Failed"
+        let completed_entry = if peek {
+            completed.get(task_id).map(|task| {
+                (
+                    task.result.clone(),
+                    task.description.clone(),
+                    task.duration,
+                    task.turns_taken,
+                )
+            })
+        } else {
+            completed.remove(task_id).map(|task| {
+                (
+                    task.result,
+                    task.description,
+                    task.duration,
+                    task.turns_taken,
+                )
+            })
+        };
+
+        if let Some((result, description, duration, turns_taken)) = completed_entry {
+            let status_key = match &result {
+                Ok(_) => "completed",
+                Err(e) if e.starts_with("Task panicked:") => "panicked",
+                Err(_) => "failed",
             };
-            let output = match task.result {
+            let status = match status_key {
+                "completed" => "✓ Completed",
+                "panicked" => "✗ Panicked",
+                _ => "✗ Failed",
+            };
+            let output = match result {
                 Ok(output) => output,
                 Err(error) => format!("Error: {}", error),
             };
-
-            return Ok(vec![Content::text(format!(
-                "# Background Task Result: {}\n\n\
-                 **Task:** {}\n\
-                 **Status:** {}\n\
-                 **Duration:** {} ({} turns)\n\n\
-                 ## Output\n\n{}",
-                task_id,
-                task.description,
-                status,
-                round_duration(task.duration),
-                task.turns_taken,
-                output
-            ))]);
+            return Ok(TaskLoadResult {
+                content: vec![Content::text(format!(
+                    "# Background Task Result: {}\n\n\
+                     **Task:** {}\n\
+                     **Status:** {}\n\
+                     **Duration:** {} ({} turns)\n\n\
+                     ## Output\n\n{}",
+                    task_id,
+                    description,
+                    status,
+                    round_duration(duration),
+                    turns_taken,
+                    output
+                ))],
+                status: status_key,
+                turns: Some(turns_taken),
+                duration_secs: Some(duration.as_secs()),
+            });
         }
 
         drop(completed);
 
         let mut running = self.background_tasks.lock().await;
         if running.contains_key(task_id) {
+            if peek {
+                let task = running.get(task_id).unwrap();
+                let elapsed = task.started_at.elapsed();
+                let turns_taken = task.turns.load(Ordering::Relaxed);
+                let now = current_epoch_millis();
+                let idle_ms = now.saturating_sub(task.last_activity.load(Ordering::Relaxed));
+                let description = task.description.clone();
+
+                let buffered_count = task.notification_buffer.lock().await.len();
+
+                drop(running);
+
+                let mut output = format!(
+                    "# Background Task Status: {}\n\n**Task:** {}\n**Status:** ⏳ Running\n**Elapsed:** {}\n**Turns taken:** {}\n**Idle:** {}\n**Buffered tool calls:** {}",
+                    task_id,
+                    description,
+                    round_duration(elapsed),
+                    turns_taken,
+                    round_duration(Duration::from_millis(idle_ms)),
+                    buffered_count,
+                );
+
+                if buffered_count == 0 && turns_taken == 0 {
+                    output.push_str("\n\n_Task is initialising (no tool activity yet)._");
+                }
+
+                return Ok(TaskLoadResult {
+                    content: vec![Content::text(output)],
+                    status: "running",
+                    turns: Some(turns_taken),
+                    duration_secs: Some(elapsed.as_secs()),
+                });
+            }
+
             if cancel {
                 let task = running.remove(task_id).unwrap();
                 drop(running);
@@ -1033,18 +1042,23 @@ impl SummonClient {
                     }
                 };
 
-                return Ok(vec![Content::text(format!(
-                    "# Background Task Result: {}\n\n\
-                     **Task:** {}\n\
-                     **Status:** ⊘ Cancelled\n\
-                     **Duration:** {} ({} turns)\n\n\
-                     ## Output\n\n{}",
-                    task_id,
-                    task.description,
-                    round_duration(duration),
-                    turns_taken,
-                    output
-                ))]);
+                return Ok(TaskLoadResult {
+                    content: vec![Content::text(format!(
+                        "# Background Task Result: {}\n\n\
+                         **Task:** {}\n\
+                         **Status:** ⊘ Cancelled\n\
+                         **Duration:** {} ({} turns)\n\n\
+                         ## Output\n\n{}",
+                        task_id,
+                        task.description,
+                        round_duration(duration),
+                        turns_taken,
+                        output
+                    ))],
+                    status: "cancelled",
+                    turns: Some(turns_taken),
+                    duration_secs: Some(duration.as_secs()),
+                });
             }
 
             // Wait for the running task to complete, keeping the tool call
@@ -1067,24 +1081,37 @@ impl SummonClient {
 
             tokio::select! {
                 result = &mut task.handle => {
-                    let output = match result {
-                        Ok(Ok(s)) => s,
-                        Ok(Err(e)) => format!("Error: {}", e),
-                        Err(e) => format!("Task panicked: {}", e),
+                    let (output, status_key) = match result {
+                        Ok(Ok(s)) => (s, "completed"),
+                        Ok(Err(e)) => (format!("Error: {}", e), "failed"),
+                        Err(e) => (format!("Task panicked: {}", e), "panicked"),
                     };
 
-                    return Ok(vec![Content::text(format!(
-                        "# Background Task Result: {}\n\n\
-                         **Task:** {}\n\
-                         **Status:** ✓ Completed\n\
-                         **Duration:** {} ({} turns)\n\n\
-                         ## Output\n\n{}",
-                        task_id,
-                        task.description,
-                        round_duration(task.started_at.elapsed()),
-                        task.turns.load(Ordering::Relaxed),
-                        output
-                    ))]);
+                    let turns_taken = task.turns.load(Ordering::Relaxed);
+                    let elapsed = task.started_at.elapsed();
+                    let status_display = match status_key {
+                        "completed" => "✓ Completed",
+                        "panicked" => "✗ Panicked",
+                        _ => "✗ Failed",
+                    };
+                    return Ok(TaskLoadResult {
+                        content: vec![Content::text(format!(
+                            "# Background Task Result: {}\n\n\
+                             **Task:** {}\n\
+                             **Status:** {}\n\
+                             **Duration:** {} ({} turns)\n\n\
+                             ## Output\n\n{}",
+                            task_id,
+                            task.description,
+                            status_display,
+                            round_duration(elapsed),
+                            turns_taken,
+                            output
+                        ))],
+                        status: status_key,
+                        turns: Some(turns_taken),
+                        duration_secs: Some(elapsed.as_secs()),
+                    });
                 }
                 _ = tokio::time::sleep(Duration::from_secs(300)) => {
                     self.background_tasks.lock().await.insert(task_id.to_string(), task);
@@ -1119,10 +1146,9 @@ impl SummonClient {
                 "No sources available for load/delegate.\n\n\
                  Sources are discovered from:\n\
                  • Current recipe's sub_recipes\n\
-                 • .agents/skills/, .agents/recipes/, .agents/agents/ (project-level)\n\
-                 • ~/.agents/skills/, ~/.agents/agents/ (global)\n\
-                 • GOOSE_RECIPE_PATH directories\n\
-                 • Builtin skills",
+                 • .agents/recipes/, .agents/agents/ (project-level)\n\
+                 • ~/.agents/agents/ (global)\n\
+                 • GOOSE_RECIPE_PATH directories",
             )]);
         }
 
@@ -1145,21 +1171,15 @@ impl SummonClient {
             }
         }
 
-        for kind in [
-            SourceKind::Subrecipe,
-            SourceKind::Recipe,
-            SourceKind::Skill,
-            SourceKind::Agent,
-            SourceKind::BuiltinSkill,
-        ] {
-            let kind_sources: Vec<_> = sources.iter().filter(|s| s.kind == kind).collect();
+        for kind in [SourceType::Subrecipe, SourceType::Recipe, SourceType::Agent] {
+            let kind_sources: Vec<_> = sources.iter().filter(|s| s.source_type == kind).collect();
             if !kind_sources.is_empty() {
                 output.push_str(&format!("\n{}:\n", kind_plural(kind)));
                 for source in kind_sources {
                     output.push_str(&format!(
                         "• {} - {}\n",
                         source.name,
-                        truncate(&source.description, 60)
+                        safe_truncate(&source.description, SUBAGENT_DESCRIPTION_BUDGET)
                     ));
                 }
             }
@@ -1183,71 +1203,15 @@ impl SummonClient {
             Some(source) => {
                 let content = source.to_load_text();
 
-                let mut output = format!(
-                    "# Loaded: {} ({})\n\n{}\n",
-                    source.name, source.kind, content
+                let output = format!(
+                    "# Loaded: {} ({})\n\n{}\n\n---\nThis knowledge is now available in your context.",
+                    source.name, source.source_type, content
                 );
-
-                if !source.supporting_files.is_empty() {
-                    output.push_str(&format!(
-                        "\n## Supporting Files\n\nSkill directory: {}\n\nThe following supporting files are available:\n",
-                        source.path.display()
-                    ));
-                    for file in &source.supporting_files {
-                        if let Ok(relative) = file.strip_prefix(&source.path) {
-                            let rel_str = relative.to_string_lossy().replace('\\', "/");
-                            output.push_str(&format!(
-                                "- {} → load(source: \"{}/{}\")\n",
-                                rel_str, source.name, rel_str
-                            ));
-                        }
-                    }
-                    output.push_str(
-                        "\nUse load(source: \"<skill-name>/<path>\") to load individual files into context, or use file tools to read/run them directly.\n",
-                    );
-                }
-
-                output.push_str("\n---\nThis knowledge is now available in your context.");
 
                 Ok(vec![Content::text(output)])
             }
             None => {
                 let sources = self.get_sources(session_id, working_dir).await;
-
-                if let Some((skill_name, _)) = name.split_once('/') {
-                    if let Some(skill) = sources.iter().find(|s| {
-                        s.name == skill_name
-                            && matches!(s.kind, SourceKind::Skill | SourceKind::BuiltinSkill)
-                    }) {
-                        let available: Vec<String> = skill
-                            .supporting_files
-                            .iter()
-                            .filter_map(|f| {
-                                f.strip_prefix(&skill.path)
-                                    .ok()
-                                    .map(|r| r.to_string_lossy().replace('\\', "/"))
-                            })
-                            .collect();
-                        if !available.is_empty() {
-                            let total = available.len();
-                            let display: Vec<_> = available.into_iter().take(10).collect();
-                            let suffix = if total > 10 {
-                                format!(" (and {} more)", total - 10)
-                            } else {
-                                String::new()
-                            };
-                            return Err(format!(
-                                "Source '{}' not found. Available files for {}: {}{}",
-                                name,
-                                skill_name,
-                                display.join(", "),
-                                suffix
-                            ));
-                        } else {
-                            return Err(format!("Skill '{}' has no supporting files.", skill_name));
-                        }
-                    }
-                }
 
                 let suggestions: Vec<&str> = sources
                     .iter()
@@ -1334,19 +1298,12 @@ impl SummonClient {
             GooseMode::Auto,
             true, // disable session naming for subagents
             crate::agents::GoosePlatform::GooseCli,
-        );
+        )
+        .with_use_login_shell_path(self.context.use_login_shell_path);
 
         let subagent_session = self
-            .context
-            .session_manager
-            .create_session(
-                working_dir,
-                "Delegated task".to_string(),
-                SessionType::SubAgent,
-                GooseMode::Auto,
-            )
-            .await
-            .map_err(|e| format!("Failed to create subagent session: {}", e))?;
+            .create_subagent_session(&task_config, "Delegated task".to_string())
+            .await?;
 
         let (notif_tx, notif_rx) = tokio::sync::mpsc::unbounded_channel::<ServerNotification>();
         Self::spawn_notification_bridge(
@@ -1411,12 +1368,19 @@ impl SummonClient {
         session_id: &str,
         working_dir: &Path,
     ) -> Result<Recipe, String> {
-        if let Some(source_name) = &params.source {
+        let mut recipe = if let Some(source_name) = &params.source {
             self.build_source_recipe(source_name, params, session_id, working_dir)
-                .await
+                .await?
         } else {
-            self.build_adhoc_recipe(params)
+            self.build_adhoc_recipe(params)?
+        };
+
+        if let Some(ref context) = params.context {
+            let existing = recipe.instructions.unwrap_or_default();
+            recipe.instructions = Some(build_instructions_with_context(context, &existing));
         }
+
+        Ok(recipe)
     }
 
     fn build_adhoc_recipe(&self, params: &DelegateParams) -> Result<Recipe, String> {
@@ -1446,24 +1410,18 @@ impl SummonClient {
             .await?
             .ok_or_else(|| format!("Source '{}' not found", source_name))?;
 
-        if source_name.contains('/')
-            && matches!(source.kind, SourceKind::Skill | SourceKind::BuiltinSkill)
-        {
-            return Err(format!(
-                "Cannot delegate to supporting file '{}'. Use load() to read it instead.",
-                source_name
-            ));
-        }
-
-        let mut recipe = match source.kind {
-            SourceKind::Recipe | SourceKind::Subrecipe => {
+        let mut recipe = match source.source_type {
+            SourceType::Recipe | SourceType::Subrecipe => {
                 self.build_recipe_from_source(&source, params, session_id)
                     .await?
             }
-            SourceKind::Skill | SourceKind::BuiltinSkill => {
-                self.build_recipe_from_skill(&source, params)?
+            SourceType::Agent => self.build_recipe_from_agent(&source, params)?,
+            _ => {
+                return Err(format!(
+                    "Source '{}' has kind '{}' which cannot be delegated from summon",
+                    source_name, source.source_type
+                ));
             }
-            SourceKind::Agent => self.build_recipe_from_agent(&source, params)?,
         };
 
         if let Some(extra_instructions) = &params.instructions {
@@ -1480,7 +1438,7 @@ impl SummonClient {
 
     async fn build_recipe_from_source(
         &self,
-        source: &Source,
+        source: &SourceEntry,
         params: &DelegateParams,
         session_id: &str,
     ) -> Result<Recipe, String> {
@@ -1491,7 +1449,7 @@ impl SummonClient {
             .await
             .map_err(|e| format!("Failed to get session: {}", e))?;
 
-        if source.kind == SourceKind::Subrecipe {
+        if source.source_type == SourceType::Subrecipe {
             let sub_recipes = session.recipe.as_ref().and_then(|r| r.sub_recipes.as_ref());
 
             if let Some(sub_recipes) = sub_recipes {
@@ -1500,21 +1458,8 @@ impl SummonClient {
                         format!("Failed to load subrecipe '{}': {}", source.name, e)
                     })?;
 
-                    let mut merged: HashMap<String, String> = HashMap::new();
-                    if let Some(values) = &sr.values {
-                        for (k, v) in values {
-                            merged.insert(k.clone(), v.clone());
-                        }
-                    }
-                    if let Some(provided_params) = &params.parameters {
-                        for (k, v) in provided_params {
-                            let value_str = match v {
-                                serde_json::Value::String(s) => s.clone(),
-                                other => other.to_string(),
-                            };
-                            merged.insert(k.clone(), value_str);
-                        }
-                    }
+                    let merged =
+                        merge_subrecipe_parameters(sr.values.as_ref(), params.parameters.as_ref());
                     let param_values: Vec<(String, String)> = merged.into_iter().collect();
 
                     return build_recipe_from_template(
@@ -1528,7 +1473,7 @@ impl SummonClient {
             }
         }
 
-        let recipe_file = load_local_recipe_file(source.path.to_str().unwrap_or(""))
+        let recipe_file = load_local_recipe_file(&source.path)
             .map_err(|e| format!("Failed to load recipe '{}': {}", source.name, e))?;
 
         let param_values: Vec<(String, String)> = params
@@ -1556,40 +1501,21 @@ impl SummonClient {
         .map_err(|e| format!("Failed to build recipe: {}", e))
     }
 
-    fn build_recipe_from_skill(
-        &self,
-        source: &Source,
-        params: &DelegateParams,
-    ) -> Result<Recipe, String> {
-        let mut builder = Recipe::builder()
-            .version("1.0.0")
-            .title(format!("Skill: {}", source.name))
-            .description(source.description.clone())
-            .instructions(&source.content);
-
-        if params.instructions.is_none() {
-            builder = builder.prompt("Apply the skill knowledge to produce a useful result.");
-        }
-
-        builder
-            .build()
-            .map_err(|e| format!("Failed to build recipe from skill: {}", e))
-    }
-
     fn build_recipe_from_agent(
         &self,
-        source: &Source,
+        source: &SourceEntry,
         params: &DelegateParams,
     ) -> Result<Recipe, String> {
-        let agent_content = if source.path.as_os_str().is_empty() {
+        let agent_content = if source.path.is_empty() {
             return Err("Agent source has no path".to_string());
         } else {
             std::fs::read_to_string(&source.path)
                 .map_err(|e| format!("Failed to read agent file: {}", e))?
         };
 
-        let (metadata, _): (AgentMetadata, String) =
-            parse_frontmatter(&agent_content).ok_or("Failed to parse agent frontmatter")?;
+        let (metadata, _): (AgentMetadata, String) = parse_frontmatter(&agent_content)
+            .map_err(|e| format!("Failed to parse agent frontmatter: {}", e))?
+            .ok_or("No frontmatter found in agent file")?;
 
         let model = metadata.model;
 
@@ -1628,7 +1554,7 @@ impl SummonClient {
         recipe: &Recipe,
         session: &crate::session::Session,
     ) -> Result<TaskConfig, anyhow::Error> {
-        let provider = self.resolve_provider(params, recipe, session).await?;
+        let (provider, model_config) = self.resolve_provider(params, recipe, session).await?;
 
         let mut extensions = EnabledExtensionsState::extensions_or_default(
             Some(&session.extension_data),
@@ -1639,7 +1565,20 @@ impl SummonClient {
             if filter.is_empty() {
                 extensions = Vec::new();
             } else {
+                let available_names: Vec<String> =
+                    extensions.iter().map(|ext| ext.name()).collect();
                 extensions.retain(|ext| filter.contains(&ext.name()));
+                let unmatched: Vec<&str> = filter
+                    .iter()
+                    .filter(|name| !available_names.iter().any(|n| n == *name))
+                    .map(String::as_str)
+                    .collect();
+                if !unmatched.is_empty() {
+                    warn!(
+                        "Delegate requested extensions not available in session: {:?}. Available: {:?}",
+                        unmatched, available_names
+                    );
+                }
             }
         }
 
@@ -1656,10 +1595,80 @@ impl SummonClient {
             );
         }
 
-        let task_config = TaskConfig::new(provider, &session.id, &session.working_dir, extensions)
-            .with_max_turns(Some(max_turns));
+        let effective_working_dir = match &params.working_dir {
+            Some(dir) => resolve_working_dir(&session.working_dir, dir)?,
+            None => session.working_dir.clone(),
+        };
+
+        let task_config = TaskConfig::new(
+            provider,
+            model_config,
+            &session.id,
+            &effective_working_dir,
+            extensions,
+        )
+        .with_max_turns(Some(max_turns));
 
         Ok(task_config)
+    }
+
+    fn resolve_model_config(
+        &self,
+        params: &DelegateParams,
+        recipe: &Recipe,
+        session: &crate::session::Session,
+        provider_name: &str,
+    ) -> Result<goose_providers::model::ModelConfig, anyhow::Error> {
+        let mut model_config = session.model_config.clone().map(Ok).unwrap_or_else(|| {
+            crate::model_config::model_config_from_user_config(provider_name, "default")
+        })?;
+
+        let override_model = params
+            .model
+            .clone()
+            .or_else(|| recipe.settings.as_ref().and_then(|s| s.goose_model.clone()))
+            .or_else(|| {
+                Config::global()
+                    .get_param::<String>("GOOSE_SUBAGENT_MODEL")
+                    .ok()
+            });
+
+        if let Some(model) = override_model {
+            if model != model_config.model_name {
+                // Build the overridden config through the canonical session-settings
+                // path. This materializes model-specific fields (context_limit,
+                // max_tokens, reasoning) and env overrides for the *new* model, and
+                // inherits only model-family-agnostic session state from the parent:
+                // reasoning controls like `thinking_effort` and `budget_tokens` carry
+                // over (with the child > parent > global-default precedence the helper
+                // applies), while provider-specific request_params such as
+                // `anthropic_beta` are dropped so they can't bleed into a child
+                // targeting a different model family and trigger a 400 INVALID_ARGUMENT.
+                let parent = model_config;
+                let mut cfg =
+                    crate::model_config::model_config_from_user_config_with_session_settings(
+                        provider_name,
+                        &model,
+                        Some(&parent),
+                        None,
+                        None,
+                    )?;
+                // Remaining model-agnostic session settings the helper doesn't
+                // touch, copied from the parent explicitly.
+                cfg.toolshim = parent.toolshim;
+                cfg.toolshim_model = parent.toolshim_model;
+                cfg.temperature = cfg.temperature.or(parent.temperature);
+                model_config = cfg;
+            }
+        }
+
+        if let Some(temp) = params.temperature {
+            model_config = model_config.with_temperature(Some(temp));
+        } else if let Some(temp) = recipe.settings.as_ref().and_then(|s| s.temperature) {
+            model_config = model_config.with_temperature(Some(temp));
+        }
+
+        Ok(model_config)
     }
 
     async fn resolve_provider(
@@ -1667,7 +1676,13 @@ impl SummonClient {
         params: &DelegateParams,
         recipe: &Recipe,
         session: &crate::session::Session,
-    ) -> Result<Arc<dyn crate::providers::base::Provider>, anyhow::Error> {
+    ) -> Result<
+        (
+            Arc<dyn crate::providers::base::Provider>,
+            goose_providers::model::ModelConfig,
+        ),
+        anyhow::Error,
+    > {
         let provider_name = params
             .provider
             .clone()
@@ -1685,30 +1700,9 @@ impl SummonClient {
             .or_else(|| session.provider_name.clone())
             .ok_or_else(|| anyhow::anyhow!("No provider configured"))?;
 
-        let mut model_config = session.model_config.clone().map(Ok).unwrap_or_else(|| {
-            crate::model::ModelConfig::new("default")
-                .map(|c| c.with_canonical_limits(&provider_name))
-        })?;
-
-        if let Some(model) = &params.model {
-            model_config.model_name = model.clone();
-        } else if let Some(model) = recipe
-            .settings
-            .as_ref()
-            .and_then(|s| s.goose_model.as_ref())
-        {
-            model_config.model_name = model.clone();
-        } else if let Ok(model) = Config::global().get_param::<String>("GOOSE_SUBAGENT_MODEL") {
-            model_config.model_name = model;
-        }
-
-        if let Some(temp) = params.temperature {
-            model_config = model_config.with_temperature(Some(temp));
-        } else if let Some(temp) = recipe.settings.as_ref().and_then(|s| s.temperature) {
-            model_config = model_config.with_temperature(Some(temp));
-        }
-
-        providers::create(&provider_name, model_config, Vec::new()).await
+        let model_config = self.resolve_model_config(params, recipe, session, &provider_name)?;
+        let provider = providers::create(&provider_name, Vec::new()).await?;
+        Ok((provider, model_config))
     }
 
     fn resolve_max_turns(&self, session: &crate::session::Session) -> usize {
@@ -1772,22 +1766,21 @@ impl SummonClient {
                     result,
                     turns_taken,
                     duration,
+                    completed_at: Instant::now(),
                 },
             );
         }
+
+        let ttl = completed_task_ttl();
+        completed.retain(|_id, task| task.completed_at.elapsed() <= ttl);
     }
 
     fn get_task_description(params: &DelegateParams) -> String {
-        if let Some(source) = &params.source {
-            if let Some(instructions) = &params.instructions {
-                format!("{}: {}", source, truncate(instructions, 30))
-            } else {
-                source.clone()
-            }
-        } else if let Some(instructions) = &params.instructions {
-            truncate(instructions, 40)
-        } else {
-            "Unknown task".to_string()
+        match (&params.source, &params.instructions) {
+            (Some(source), Some(instructions)) => format!("{}: {}", source, instructions),
+            (Some(source), None) => source.clone(),
+            (None, Some(instructions)) => instructions.clone(),
+            (None, None) => "Unknown task".to_string(),
         }
     }
 
@@ -1822,7 +1815,7 @@ impl SummonClient {
             .await
             .map_err(|e| format!("Failed to build task config: {}", e))?;
 
-        let description = truncate(&Self::get_task_description(&params), 40);
+        let description = safe_truncate(&Self::get_task_description(&params), TASK_LABEL_BUDGET);
 
         // Subagents must use Auto until get_agent_messages forwards
         // ActionRequired messages to the parent. Until then, any mode
@@ -1834,19 +1827,12 @@ impl SummonClient {
             GooseMode::Auto,
             true, // disable session naming for subagents
             crate::agents::GoosePlatform::GooseCli,
-        );
+        )
+        .with_use_login_shell_path(self.context.use_login_shell_path);
 
         let subagent_session = self
-            .context
-            .session_manager
-            .create_session(
-                working_dir,
-                description.clone(),
-                SessionType::SubAgent,
-                GooseMode::Auto,
-            )
-            .await
-            .map_err(|e| format!("Failed to create subagent session: {}", e))?;
+            .create_subagent_session(&task_config, description.clone())
+            .await?;
 
         let task_id = subagent_session.id.clone();
 
@@ -1982,6 +1968,15 @@ impl McpClientTrait for SummonClient {
         Some(&self.info)
     }
 
+    fn get_instructions(&self) -> Option<String> {
+        let instructions = build_subagent_instructions(self.context.session.as_deref());
+        if instructions.is_empty() {
+            None
+        } else {
+            Some(instructions)
+        }
+    }
+
     async fn subscribe(&self) -> mpsc::Receiver<ServerNotification> {
         let (tx, rx) = mpsc::channel(16);
         self.notification_subscribers.lock().await.push(tx);
@@ -2049,10 +2044,39 @@ impl McpClientTrait for SummonClient {
     }
 }
 
+/// Resolve a requested `working_dir` override against the parent session
+/// directory. Relative paths are joined to the parent dir; the result must
+/// canonicalize to an existing directory contained within the parent dir.
+fn resolve_working_dir(parent_dir: &Path, requested: &str) -> Result<PathBuf, anyhow::Error> {
+    let requested_path = PathBuf::from(requested);
+    let resolved = if requested_path.is_absolute() {
+        requested_path
+    } else {
+        parent_dir.join(&requested_path)
+    };
+    let canonical = resolved
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("working_dir '{}' could not be resolved: {}", requested, e))?;
+    let parent_canonical = parent_dir
+        .canonicalize()
+        .unwrap_or_else(|_| parent_dir.to_path_buf());
+    if !canonical.starts_with(&parent_canonical) {
+        anyhow::bail!(
+            "working_dir '{}' is outside the parent session directory",
+            requested
+        );
+    }
+    if !canonical.is_dir() {
+        anyhow::bail!("working_dir '{}' is not a directory", requested);
+    }
+    Ok(canonical)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -2062,488 +2086,290 @@ mod tests {
             extension_manager: None,
             session_manager: Arc::new(crate::session::SessionManager::instance()),
             session: None,
+            use_login_shell_path: false,
         }
     }
 
     #[test]
-    fn test_frontmatter_parsing() {
-        let skill = r#"---
-name: test-skill
-description: A test skill
----
-Skill body here."#;
-        let source = parse_skill_content(skill, PathBuf::new()).unwrap();
-        assert_eq!(source.name, "test-skill");
-        assert_eq!(source.kind, SourceKind::Skill);
-        assert!(source.content.contains("Skill body"));
-
+    fn test_agent_frontmatter_parsing() {
         let agent = r#"---
 name: reviewer
 model: sonnet
 ---
 You review code."#;
-        let source = parse_agent_content(agent, PathBuf::new()).unwrap();
+        let source = parse_agent_content(agent, Path::new("")).unwrap();
         assert_eq!(source.name, "reviewer");
         assert!(source.description.contains("sonnet"));
+    }
 
-        assert!(parse_skill_content("no frontmatter", PathBuf::new()).is_none());
-        assert!(parse_skill_content("---\nunclosed", PathBuf::new()).is_none());
+    #[test]
+    fn test_resolve_working_dir_relative_subdir() {
+        let temp_dir = TempDir::new().unwrap();
+        let parent = temp_dir.path().canonicalize().unwrap();
+        let subdir = parent.join("sub");
+        fs::create_dir(&subdir).unwrap();
+
+        let resolved = resolve_working_dir(&parent, "sub").unwrap();
+        assert_eq!(resolved, subdir.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn test_resolve_working_dir_rejects_traversal_outside_parent() {
+        let temp_dir = TempDir::new().unwrap();
+        let parent = temp_dir.path().join("parent");
+        let sibling = temp_dir.path().join("sibling");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&sibling).unwrap();
+
+        let err = resolve_working_dir(&parent, "../sibling").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("outside the parent session directory"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_working_dir_rejects_file_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let parent = temp_dir.path().canonicalize().unwrap();
+        let file = parent.join("a.txt");
+        fs::write(&file, "hello").unwrap();
+
+        let err = resolve_working_dir(&parent, "a.txt").unwrap_err();
+        assert!(
+            err.to_string().contains("is not a directory"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_working_dir_rejects_nonexistent_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let parent = temp_dir.path().canonicalize().unwrap();
+
+        let err = resolve_working_dir(&parent, "does-not-exist").unwrap_err();
+        assert!(
+            err.to_string().contains("could not be resolved"),
+            "unexpected error: {err}"
+        );
+    }
+    #[test]
+    fn test_agent_scan_skips_non_agent_markdown() {
+        let temp_dir = TempDir::new().unwrap();
+        let agents_dir = temp_dir.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::write(
+            agents_dir.join("README.md"),
+            "---\ntitle: Notes\n---\nThis is not an agent.",
+        )
+        .unwrap();
+        fs::write(
+            agents_dir.join("notes.md"),
+            "---\nauthor: someone\ntags: [docs]\n---\nJust documentation.",
+        )
+        .unwrap();
+        fs::write(
+            agents_dir.join("reviewer.md"),
+            "---\nname: reviewer\nmodel: sonnet\n---\nYou review code.",
+        )
+        .unwrap();
+        fs::write(agents_dir.join("plain.md"), "No frontmatter at all.").unwrap();
+        fs::write(
+            agents_dir.join("broken.md"),
+            "---\nname: [unterminated\n---\nBroken YAML.",
+        )
+        .unwrap();
+
+        let mut sources = Vec::new();
+        let mut seen = HashSet::new();
+        scan_agents_from_dir(&agents_dir, &mut sources, &mut seen);
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name, "reviewer");
+    }
+
+    #[test]
+    fn test_recipe_scan_skips_non_recipe_project_config_files() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{"scripts":{"test":"cargo test"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"strict":true}}"#,
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("valid.yaml"),
+            "title: Valid\ndescription: Real recipe\ninstructions: Run valid steps",
+        )
+        .unwrap();
+
+        let mut sources = Vec::new();
+        let mut seen = HashSet::new();
+        scan_recipes_from_dir(
+            temp_dir.path(),
+            SourceType::Recipe,
+            true,
+            &mut sources,
+            &mut seen,
+        );
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name, "valid");
+        assert_eq!(sources[0].description, "Real recipe");
     }
 
     #[tokio::test]
-    async fn test_source_discovery_and_priority() {
+    async fn test_discover_recipes_and_agents() {
         let temp_dir = TempDir::new().unwrap();
-
-        let goose_skill = temp_dir.path().join(".goose/skills/my-skill");
-        fs::create_dir_all(&goose_skill).unwrap();
-        fs::write(
-            goose_skill.join("SKILL.md"),
-            "---\nname: my-skill\ndescription: goose version\n---\nContent",
-        )
-        .unwrap();
-
-        let claude_skill = temp_dir.path().join(".claude/skills/my-skill");
-        fs::create_dir_all(&claude_skill).unwrap();
-        fs::write(
-            claude_skill.join("SKILL.md"),
-            "---\nname: my-skill\ndescription: claude version\n---\nContent",
-        )
-        .unwrap();
 
         let recipes = temp_dir.path().join(".goose/recipes");
         fs::create_dir_all(&recipes).unwrap();
         fs::write(
-            recipes.join("test.yaml"),
-            "title: Test\ndescription: A recipe\ninstructions: Do it",
+            recipes.join("deploy.yaml"),
+            "title: Deploy\ndescription: Deploy to production\ninstructions: Run deploy steps",
+        )
+        .unwrap();
+
+        let agents = temp_dir.path().join(".goose/agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(
+            agents.join("reviewer.md"),
+            "---\nname: reviewer\nmodel: sonnet\ndescription: Code reviewer\n---\nYou review code.",
         )
         .unwrap();
 
         let client = SummonClient::new(create_test_context()).unwrap();
         let sources = client.discover_filesystem_sources(temp_dir.path());
 
-        let skill = sources.iter().find(|s| s.name == "my-skill").unwrap();
-        assert_eq!(skill.description, "goose version");
-
-        assert!(sources
+        let recipe = sources
             .iter()
-            .any(|s| s.name == "test" && s.kind == SourceKind::Recipe));
+            .find(|s| s.name == "deploy" && s.source_type == SourceType::Recipe)
+            .unwrap();
+        assert_eq!(recipe.description, "Deploy to production");
+        assert_eq!(recipe.content, "Run deploy steps");
 
-        assert!(sources.iter().any(|s| s.kind == SourceKind::BuiltinSkill));
-    }
-
-    #[tokio::test]
-    async fn test_skill_supporting_files_discovered() {
-        let temp_dir = TempDir::new().unwrap();
-
-        let skill_dir = temp_dir.path().join(".goose/skills/my-skill");
-        fs::create_dir_all(skill_dir.join("templates/nested")).unwrap();
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: my-skill\ndescription: A skill with scripts\n---\nRun check_all.sh",
-        )
-        .unwrap();
-        fs::write(skill_dir.join("myscript.sh"), "#!/bin/bash\necho ok").unwrap();
-        fs::write(skill_dir.join("templates/report.txt"), "template content").unwrap();
-        fs::write(
-            skill_dir.join("templates/nested/checklist.txt"),
-            "nested template content",
-        )
-        .unwrap();
-
-        let client = SummonClient::new(create_test_context()).unwrap();
-        let sources = client.discover_filesystem_sources(temp_dir.path());
-
-        let skill = sources.iter().find(|s| s.name == "my-skill").unwrap();
-        assert_eq!(skill.path, skill_dir);
-        assert_eq!(skill.supporting_files.len(), 3);
-
-        let file_names: Vec<String> = skill
-            .supporting_files
+        let agent = sources
             .iter()
-            .filter_map(|f| f.file_name().map(|n| n.to_string_lossy().to_string()))
-            .collect();
-        assert!(file_names.contains(&"myscript.sh".to_string()));
-        assert!(file_names.contains(&"report.txt".to_string()));
-        assert!(file_names.contains(&"checklist.txt".to_string()));
+            .find(|s| s.name == "reviewer" && s.source_type == SourceType::Agent)
+            .unwrap();
+        assert_eq!(agent.description, "Code reviewer");
+        assert!(agent.content.contains("You review code"));
     }
 
     #[tokio::test]
-    async fn test_nested_claude_catalog_skills_discovered() {
+    async fn test_recipe_deduplication_local_wins() {
         let temp_dir = TempDir::new().unwrap();
 
-        let root_skill_file = temp_dir.path().join(".claude/skills/SKILL.md");
-        fs::create_dir_all(root_skill_file.parent().unwrap()).unwrap();
+        let local = temp_dir.path().join(".goose/recipes");
+        fs::create_dir_all(&local).unwrap();
         fs::write(
-            &root_skill_file,
-            "---\nname: root-skill\ndescription: Root level skill\n---\nRoot content",
+            local.join("deploy.yaml"),
+            "title: Deploy\ndescription: Local deploy\ninstructions: local steps",
         )
         .unwrap();
 
-        let nested_skill_dir = temp_dir.path().join(".claude/skills/catalog/internal/ai");
-        fs::create_dir_all(&nested_skill_dir).unwrap();
+        let also_local = temp_dir.path().join(".agents/recipes");
+        fs::create_dir_all(&also_local).unwrap();
         fs::write(
-            nested_skill_dir.join("SKILL.md"),
-            "---\nname: nested-skill\ndescription: Nested catalog skill\n---\nNested content",
+            also_local.join("deploy.yaml"),
+            "title: Deploy\ndescription: Agents deploy\ninstructions: agents steps",
         )
         .unwrap();
 
         let client = SummonClient::new(create_test_context()).unwrap();
         let sources = client.discover_filesystem_sources(temp_dir.path());
 
-        let root_skill = sources.iter().find(|s| s.name == "root-skill").unwrap();
-        assert_eq!(root_skill.path, temp_dir.path().join(".claude/skills"));
-
-        let nested_skill = sources.iter().find(|s| s.name == "nested-skill").unwrap();
-        assert_eq!(nested_skill.path, nested_skill_dir);
+        let deploys: Vec<_> = sources.iter().filter(|s| s.name == "deploy").collect();
+        assert_eq!(deploys.len(), 1);
     }
 
     #[tokio::test]
-    async fn test_root_skill_supporting_files_exclude_nested_skill_subtrees() {
+    async fn test_load_recipe_source() {
         let temp_dir = TempDir::new().unwrap();
 
-        let root_skill_dir = temp_dir.path().join(".claude/skills");
-        fs::create_dir_all(&root_skill_dir).unwrap();
+        let recipes = temp_dir.path().join(".goose/recipes");
+        fs::create_dir_all(&recipes).unwrap();
         fs::write(
-            root_skill_dir.join("SKILL.md"),
-            "---\nname: root-skill\ndescription: Root level skill\n---\nRoot content",
+            recipes.join("deploy.yaml"),
+            "title: Deploy\ndescription: Deploy to production\ninstructions: Run deploy steps",
         )
         .unwrap();
-        fs::write(root_skill_dir.join("README.md"), "root readme").unwrap();
-
-        let nested_skill_dir = root_skill_dir.join("catalog/internal/ai");
-        fs::create_dir_all(&nested_skill_dir).unwrap();
-        fs::write(
-            nested_skill_dir.join("SKILL.md"),
-            "---\nname: nested-skill\ndescription: Nested catalog skill\n---\nNested content",
-        )
-        .unwrap();
-        fs::write(nested_skill_dir.join("notes.md"), "nested notes").unwrap();
-
-        let client = SummonClient::new(create_test_context()).unwrap();
-        let sources = client.discover_filesystem_sources(temp_dir.path());
-
-        let root_skill = sources.iter().find(|s| s.name == "root-skill").unwrap();
-        assert!(root_skill
-            .supporting_files
-            .contains(&root_skill_dir.join("README.md")));
-        assert!(!root_skill
-            .supporting_files
-            .contains(&nested_skill_dir.join("SKILL.md")));
-        assert!(!root_skill
-            .supporting_files
-            .contains(&nested_skill_dir.join("notes.md")));
-    }
-
-    #[tokio::test]
-    async fn test_skill_discovery_preserves_dot_prefixed_paths() {
-        let temp_dir = TempDir::new().unwrap();
-
-        let dot_skill_dir = temp_dir.path().join(".claude/skills/.team");
-        fs::create_dir_all(&dot_skill_dir).unwrap();
-        fs::write(
-            dot_skill_dir.join("SKILL.md"),
-            "---\nname: team-skill\ndescription: Dot skill\n---\nTeam content",
-        )
-        .unwrap();
-        fs::write(dot_skill_dir.join(".env.example"), "EXAMPLE=1").unwrap();
-
-        let git_skill_dir = temp_dir.path().join(".claude/skills/.git/hidden-skill");
-        fs::create_dir_all(&git_skill_dir).unwrap();
-        fs::write(
-            git_skill_dir.join("SKILL.md"),
-            "---\nname: hidden-git-skill\ndescription: Hidden git skill\n---\nHidden content",
-        )
-        .unwrap();
-
-        let client = SummonClient::new(create_test_context()).unwrap();
-        let sources = client.discover_filesystem_sources(temp_dir.path());
-
-        let dot_skill = sources.iter().find(|s| s.name == "team-skill").unwrap();
-        assert_eq!(dot_skill.path, dot_skill_dir);
-        assert!(dot_skill
-            .supporting_files
-            .contains(&dot_skill_dir.join(".env.example")));
-        assert!(!sources.iter().any(|s| s.name == "hidden-git-skill"));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_symlinked_skill_directory_is_discovered() {
-        let temp_dir = TempDir::new().unwrap();
-
-        let shared_skill_dir = temp_dir.path().join("shared-skills/ai");
-        fs::create_dir_all(&shared_skill_dir).unwrap();
-        fs::write(
-            shared_skill_dir.join("SKILL.md"),
-            "---\nname: shared-ai\ndescription: Shared skill\n---\nShared content",
-        )
-        .unwrap();
-        fs::write(shared_skill_dir.join("notes.md"), "shared notes").unwrap();
-
-        let linked_catalog_dir = temp_dir.path().join(".claude/skills/catalog/internal");
-        fs::create_dir_all(&linked_catalog_dir).unwrap();
-        std::os::unix::fs::symlink(&shared_skill_dir, linked_catalog_dir.join("ai")).unwrap();
-
-        let client = SummonClient::new(create_test_context()).unwrap();
-        let sources = client.discover_filesystem_sources(temp_dir.path());
-
-        let skill = sources.iter().find(|s| s.name == "shared-ai").unwrap();
-        assert_eq!(skill.path, linked_catalog_dir.join("ai"));
-        assert!(skill
-            .supporting_files
-            .contains(&linked_catalog_dir.join("ai/notes.md")));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_skill_discovery_avoids_symlink_cycles() {
-        let temp_dir = TempDir::new().unwrap();
-
-        let skill_dir = temp_dir.path().join(".goose/skills/my-skill");
-        fs::create_dir_all(skill_dir.join("refs")).unwrap();
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: my-skill\ndescription: A skill with a loop\n---\nLoop safe",
-        )
-        .unwrap();
-        fs::write(skill_dir.join("refs/guide.md"), "guide content").unwrap();
-        std::os::unix::fs::symlink(&skill_dir, skill_dir.join("refs/loop")).unwrap();
-
-        let client = SummonClient::new(create_test_context()).unwrap();
-        let sources = client.discover_filesystem_sources(temp_dir.path());
-
-        let skill = sources.iter().find(|s| s.name == "my-skill").unwrap();
-        assert_eq!(skill.path, skill_dir);
-        assert!(skill
-            .supporting_files
-            .contains(&skill_dir.join("refs/guide.md")));
-        assert_eq!(
-            skill
-                .supporting_files
-                .iter()
-                .filter(|path| *path == &skill_dir.join("refs/guide.md"))
-                .count(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn test_load_source_lists_supporting_files_with_load_names() {
-        let temp_dir = TempDir::new().unwrap();
-
-        let skill_dir = temp_dir.path().join(".goose/skills/my-skill");
-        fs::create_dir_all(skill_dir.join("references")).unwrap();
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: my-skill\ndescription: A skill\n---\nSee references.",
-        )
-        .unwrap();
-        fs::write(
-            skill_dir.join("references/ops.md"),
-            "# Ops Guide\n\nDo the thing.",
-        )
-        .unwrap();
-        fs::write(skill_dir.join("run.sh"), "#!/bin/bash\necho ok").unwrap();
 
         let client = SummonClient::new(create_test_context()).unwrap();
         let result = client
-            .handle_load_source("test", "my-skill", temp_dir.path())
+            .handle_load_source("test", "deploy", temp_dir.path())
             .await
             .unwrap();
 
         let text = &result[0].as_text().expect("expected text content").text;
-
-        assert!(
-            !text.contains("Ops Guide"),
-            "md file content should not be inlined"
-        );
-        assert!(
-            !text.contains("Do the thing."),
-            "md file content should not be inlined"
-        );
-        assert!(
-            !text.contains("#!/bin/bash"),
-            "script content should not be inlined"
-        );
-        assert!(
-            text.contains("load(source: \"my-skill/references/ops.md\")"),
-            "md file should be listed with load() name"
-        );
-        assert!(
-            text.contains("load(source: \"my-skill/run.sh\")"),
-            "script should be listed with load() name"
-        );
-        assert!(
-            text.contains("load(source: \"<skill-name>/<path>\")"),
-            "should include usage hint"
-        );
+        assert!(text.contains("deploy"));
+        assert!(text.contains("Run deploy steps"));
+        assert!(text.contains("now available in your context"));
     }
 
     #[tokio::test]
-    async fn test_load_supporting_file_by_path() {
+    async fn test_load_agent_source() {
         let temp_dir = TempDir::new().unwrap();
 
-        let skill_dir = temp_dir.path().join(".goose/skills/my-skill");
-        fs::create_dir_all(skill_dir.join("references")).unwrap();
+        let agents = temp_dir.path().join(".goose/agents");
+        fs::create_dir_all(&agents).unwrap();
         fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: my-skill\ndescription: A skill\n---\nSee references.",
+            agents.join("reviewer.md"),
+            "---\nname: reviewer\nmodel: sonnet\ndescription: Code reviewer\n---\nYou review code carefully.",
         )
         .unwrap();
-        fs::write(
-            skill_dir.join("references/ops.md"),
-            "# Ops Guide\n\nDo the thing.",
-        )
-        .unwrap();
-        fs::write(skill_dir.join("run.sh"), "#!/bin/bash\necho ok").unwrap();
 
         let client = SummonClient::new(create_test_context()).unwrap();
-
-        let md_result = client
-            .handle_load_source("test", "my-skill/references/ops.md", temp_dir.path())
+        let result = client
+            .handle_load_source("test", "reviewer", temp_dir.path())
             .await
             .unwrap();
-        let md_text = &md_result[0].as_text().expect("expected text content").text;
-        assert!(
-            md_text.contains("Ops Guide"),
-            "markdown content should be loaded"
-        );
-        assert!(md_text.contains("Do the thing."));
 
-        let sh_result = client
-            .handle_load_source("test", "my-skill/run.sh", temp_dir.path())
-            .await
-            .unwrap();
-        let sh_text = &sh_result[0].as_text().expect("expected text content").text;
-        assert!(
-            sh_text.contains("#!/bin/bash"),
-            "script content should be loaded"
-        );
+        let text = &result[0].as_text().expect("expected text content").text;
+        assert!(text.contains("reviewer"));
+        assert!(text.contains("You review code carefully"));
+        assert!(text.contains("now available in your context"));
     }
 
     #[tokio::test]
-    async fn test_load_supporting_file_not_found_suggests_available() {
+    async fn test_load_nonexistent_source_suggests_similar() {
         let temp_dir = TempDir::new().unwrap();
 
-        let skill_dir = temp_dir.path().join(".goose/skills/my-skill");
-        fs::create_dir_all(skill_dir.join("references")).unwrap();
+        let recipes = temp_dir.path().join(".goose/recipes");
+        fs::create_dir_all(&recipes).unwrap();
         fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: my-skill\ndescription: A skill\n---\nSee references.",
-        )
-        .unwrap();
-        fs::write(
-            skill_dir.join("references/ops.md"),
-            "# Ops Guide\n\nDo the thing.",
+            recipes.join("deploy.yaml"),
+            "title: Deploy\ndescription: Deploy to production\ninstructions: steps",
         )
         .unwrap();
 
         let client = SummonClient::new(create_test_context()).unwrap();
         let err = client
-            .handle_load_source(
-                "test",
-                "my-skill/references/nonexistent.md",
-                temp_dir.path(),
-            )
+            .handle_load_source("test", "deploy-prod", temp_dir.path())
             .await
             .unwrap_err();
 
-        assert!(
-            err.contains("references/ops.md"),
-            "error should list available files: {}",
-            err
-        );
-        assert!(
-            err.contains("my-skill"),
-            "error should name the skill: {}",
-            err
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_resolve_source_blocks_symlink_outside_skill_dir() {
-        let temp_dir = TempDir::new().unwrap();
-        let outside_dir = TempDir::new().unwrap();
-
-        let skill_dir = temp_dir.path().join(".goose/skills/my-skill");
-        fs::create_dir_all(&skill_dir).unwrap();
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: my-skill\ndescription: A skill\n---\nContent.",
-        )
-        .unwrap();
-
-        let secret_file = outside_dir.path().join("secret.txt");
-        fs::write(&secret_file, "top secret data").unwrap();
-        std::os::unix::fs::symlink(&secret_file, skill_dir.join("evil.md")).unwrap();
-
-        let client = SummonClient::new(create_test_context()).unwrap();
-        let result = client
-            .handle_load_source("test", "my-skill/evil.md", temp_dir.path())
-            .await;
-
-        assert!(
-            result.is_err(),
-            "symlink outside skill dir should be blocked"
-        );
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("resolves outside the skill directory"),
-            "error should mention path traversal: {}",
-            err
-        );
+        assert!(err.contains("not found"));
+        assert!(err.contains("deploy"), "should suggest 'deploy': {}", err);
     }
 
     #[tokio::test]
-    async fn test_resolve_source_blocks_path_traversal_input() {
+    async fn test_load_completely_unknown_source() {
         let temp_dir = TempDir::new().unwrap();
 
-        let skill_dir = temp_dir.path().join(".goose/skills/my-skill");
-        fs::create_dir_all(&skill_dir).unwrap();
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: my-skill\ndescription: A skill\n---\nContent.",
-        )
-        .unwrap();
-        fs::write(skill_dir.join("legit.md"), "legit content").unwrap();
-
         let client = SummonClient::new(create_test_context()).unwrap();
+        let err = client
+            .handle_load_source("test", "zzz-nonexistent", temp_dir.path())
+            .await
+            .unwrap_err();
 
-        // ../../../etc/passwd won't match any supporting_files entry, so it returns Ok (not found)
-        // which becomes the "not found" error path in handle_load_source
-        let result = client
-            .handle_load_source("test", "my-skill/../../../etc/passwd", temp_dir.path())
-            .await;
-
-        assert!(result.is_err(), "traversal path should not load content");
-        let err = result.unwrap_err();
-        assert!(
-            !err.contains("root:"),
-            "should not contain /etc/passwd content: {}",
-            err
-        );
-    }
-
-    #[tokio::test]
-    async fn test_skill_name_with_slash_is_rejected() {
-        let temp_dir = TempDir::new().unwrap();
-
-        let skill_dir = temp_dir.path().join(".goose/skills/bad-skill");
-        fs::create_dir_all(&skill_dir).unwrap();
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: bad/skill\ndescription: A skill with slash\n---\nContent.",
-        )
-        .unwrap();
-
-        let client = SummonClient::new(create_test_context()).unwrap();
-        let sources = client.get_sources("test", temp_dir.path()).await;
-
-        assert!(
-            !sources.iter().any(|s| s.name == "bad/skill"),
-            "skill with '/' in name should be rejected"
-        );
+        assert!(err.contains("not found"));
+        assert!(err.contains("Use load()"));
     }
 
     #[tokio::test]
@@ -2596,10 +2422,71 @@ You review code."#;
             SummonClient::get_task_description(&make_params(Some("r"), Some("task"))),
             "r: task"
         );
+        assert_eq!(
+            SummonClient::get_task_description(&make_params(None, None)),
+            "Unknown task"
+        );
+    }
 
-        let long = "x".repeat(100);
-        let desc = SummonClient::get_task_description(&make_params(None, Some(&long)));
-        assert!(desc.len() <= 43 && desc.ends_with("..."));
+    #[tokio::test]
+    async fn test_context_injected_into_adhoc_recipe() {
+        let temp_dir = TempDir::new().unwrap();
+        let client = SummonClient::new(create_test_context()).unwrap();
+
+        let params = DelegateParams {
+            instructions: Some("do the task".to_string()),
+            context: Some("background info".to_string()),
+            ..Default::default()
+        };
+
+        let recipe = client
+            .build_delegate_recipe(&params, "test", temp_dir.path())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            recipe.instructions.as_deref(),
+            Some("# Reference Context\n\nbackground info")
+        );
+        assert_eq!(recipe.prompt.as_deref(), Some("do the task"));
+    }
+
+    #[test]
+    fn test_subrecipe_fixed_values_take_precedence_over_delegate_parameters() {
+        let fixed = HashMap::from([("fixed".to_string(), "parent-value".to_string())]);
+        let provided = HashMap::from([
+            (
+                "fixed".to_string(),
+                serde_json::Value::String("delegate-value".to_string()),
+            ),
+            (
+                "caller".to_string(),
+                serde_json::Value::String("caller-value".to_string()),
+            ),
+        ]);
+
+        let merged = merge_subrecipe_parameters(Some(&fixed), Some(&provided));
+
+        assert_eq!(
+            merged.get("fixed").map(String::as_str),
+            Some("parent-value")
+        );
+        assert_eq!(
+            merged.get("caller").map(String::as_str),
+            Some("caller-value")
+        );
+    }
+
+    #[test]
+    fn test_build_instructions_with_context_wraps_existing_instructions() {
+        assert_eq!(
+            build_instructions_with_context("background info", "Run deploy steps"),
+            "# Reference Context\n\nbackground info\n\n# Task Instructions\n\nRun deploy steps"
+        );
+        assert_eq!(
+            build_instructions_with_context("background info", ""),
+            "# Reference Context\n\nbackground info"
+        );
     }
 
     #[test]
@@ -2706,6 +2593,157 @@ You review code."#;
         );
     }
 
+    fn empty_recipe() -> crate::recipe::Recipe {
+        crate::recipe::Recipe {
+            version: "1.0.0".to_string(),
+            title: String::new(),
+            description: String::new(),
+            instructions: None,
+            prompt: None,
+            extensions: None,
+            settings: None,
+            activities: None,
+            author: None,
+            parameters: None,
+            response: None,
+            sub_recipes: None,
+            retry: None,
+        }
+    }
+
+    const PARENT_MODEL: &str = "claude-3-5-sonnet-20241022";
+    const OVERRIDE_MODEL: &str = "claude-opus-4-6";
+    const PROVIDER: &str = "anthropic";
+
+    fn session_with(parent: goose_providers::model::ModelConfig) -> crate::session::Session {
+        crate::session::Session {
+            provider_name: Some(PROVIDER.to_string()),
+            model_config: Some(parent),
+            ..Default::default()
+        }
+    }
+
+    fn resolve_with_override(
+        model: Option<&str>,
+        parent: goose_providers::model::ModelConfig,
+    ) -> goose_providers::model::ModelConfig {
+        let client = SummonClient::new(create_test_context()).unwrap();
+        let params = DelegateParams {
+            model: model.map(String::from),
+            ..Default::default()
+        };
+        client
+            .resolve_model_config(&params, &empty_recipe(), &session_with(parent), PROVIDER)
+            .expect("resolve_model_config")
+    }
+
+    fn parent_config() -> goose_providers::model::ModelConfig {
+        goose_providers::model::ModelConfig::new(PARENT_MODEL).with_canonical_limits(PROVIDER)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_model_config_applies_canonical_limits_to_overridden_model() {
+        let _env = env_lock::lock_env([
+            ("GOOSE_CONTEXT_LIMIT", None::<&str>),
+            ("GOOSE_MAX_TOKENS", None::<&str>),
+            ("GOOSE_SUBAGENT_MODEL", None::<&str>),
+        ]);
+
+        let parent = parent_config();
+        let overridden = goose_providers::model::ModelConfig::new(OVERRIDE_MODEL)
+            .with_canonical_limits(PROVIDER);
+        assert_ne!(parent.context_limit, overridden.context_limit);
+        assert_ne!(parent.reasoning, overridden.reasoning);
+
+        let resolved = resolve_with_override(Some(OVERRIDE_MODEL), parent);
+
+        assert_eq!(resolved.model_name, OVERRIDE_MODEL);
+        assert_eq!(resolved.context_limit, overridden.context_limit);
+        assert_eq!(resolved.max_tokens, overridden.max_tokens);
+        assert_eq!(resolved.reasoning, overridden.reasoning);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_model_config_does_not_inherit_provider_specific_request_params() {
+        let _env = env_lock::lock_env([
+            ("GOOSE_CONTEXT_LIMIT", None::<&str>),
+            ("GOOSE_MAX_TOKENS", None::<&str>),
+            ("GOOSE_SUBAGENT_MODEL", None::<&str>),
+        ]);
+
+        // Parent session is a Claude model with anthropic_beta in request_params.
+        // When delegate() overrides to a different model (e.g. Gemini), provider-
+        // specific params like anthropic_beta must not bleed through — they would
+        // cause a 400 INVALID_ARGUMENT from the target API.
+        let mut parent = parent_config();
+        parent.request_params = Some(HashMap::from([(
+            "anthropic_beta".to_string(),
+            serde_json::json!("custom-beta-header"),
+        )]));
+
+        let resolved = resolve_with_override(Some(OVERRIDE_MODEL), parent);
+
+        assert_eq!(
+            resolved
+                .request_params
+                .as_ref()
+                .and_then(|p| p.get("anthropic_beta")),
+            None,
+            "anthropic_beta must not be inherited by a child session with a different model"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_model_config_inherits_thinking_effort_on_override() {
+        let _env = env_lock::lock_env([
+            ("GOOSE_CONTEXT_LIMIT", None::<&str>),
+            ("GOOSE_MAX_TOKENS", None::<&str>),
+            ("GOOSE_SUBAGENT_MODEL", None::<&str>),
+        ]);
+
+        // Reasoning controls are model-family-agnostic and should be inherited,
+        // while provider-specific params like anthropic_beta must not.
+        let mut parent = parent_config();
+        parent.request_params = Some(HashMap::from([
+            ("thinking_effort".to_string(), serde_json::json!("high")),
+            ("budget_tokens".to_string(), serde_json::json!(8192)),
+            (
+                "anthropic_beta".to_string(),
+                serde_json::json!("custom-beta-header"),
+            ),
+        ]));
+
+        let resolved = resolve_with_override(Some(OVERRIDE_MODEL), parent);
+
+        assert_eq!(
+            resolved
+                .request_params
+                .as_ref()
+                .and_then(|p| p.get("thinking_effort")),
+            Some(&serde_json::json!("high")),
+            "thinking_effort should be inherited across model families"
+        );
+        assert_eq!(
+            resolved
+                .request_params
+                .as_ref()
+                .and_then(|p| p.get("budget_tokens")),
+            Some(&serde_json::json!(8192)),
+            "budget_tokens should be inherited across model families"
+        );
+        assert_eq!(
+            resolved
+                .request_params
+                .as_ref()
+                .and_then(|p| p.get("anthropic_beta")),
+            None,
+            "anthropic_beta must not be inherited alongside reasoning controls"
+        );
+    }
+
     fn extract_text(content: &Content) -> &str {
         use rmcp::model::RawContent;
         match &content.raw {
@@ -2730,7 +2768,9 @@ You review code."#;
         let client = SummonClient::new(create_test_context()).unwrap();
         let temp_dir = TempDir::new().unwrap();
 
-        let result = client.handle_load_task_result("20260204_999", false).await;
+        let result = client
+            .handle_load_task_result("20260204_999", false, false)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
 
@@ -2772,10 +2812,10 @@ You review code."#;
         let mut subscriber = client.subscribe().await;
 
         let result = client
-            .handle_load_task_result("20260204_1", false)
+            .handle_load_task_result("20260204_1", false, false)
             .await
             .expect("load should wait and return result");
-        let text = extract_text(&result[0]);
+        let text = extract_text(&result.content[0]);
         assert!(text.contains("Completed"));
         assert!(text.contains("done"));
 
@@ -2802,6 +2842,7 @@ You review code."#;
                     result: Ok("Task completed successfully with output".to_string()),
                     turns_taken: 5,
                     duration: Duration::from_secs(60),
+                    completed_at: Instant::now(),
                 },
             );
             completed.insert(
@@ -2812,6 +2853,7 @@ You review code."#;
                     result: Err("Something went wrong".to_string()),
                     turns_taken: 3,
                     duration: Duration::from_secs(30),
+                    completed_at: Instant::now(),
                 },
             );
         }
@@ -2832,16 +2874,18 @@ You review code."#;
         assert!(discovery_text.contains("20260204_3"));
 
         let result = client
-            .handle_load_task_result("20260204_2", false)
+            .handle_load_task_result("20260204_2", false, false)
             .await
             .unwrap();
-        let text = extract_text(&result[0]);
+        let text = extract_text(&result.content[0]);
         assert!(text.contains("20260204_2"));
         assert!(text.contains("Successful task"));
         assert!(text.contains("✓ Completed"));
         assert!(text.contains("1m"));
         assert!(text.contains("5 turns"));
         assert!(text.contains("Task completed successfully with output"));
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.turns, Some(5));
 
         assert!(!client
             .completed_tasks
@@ -2850,14 +2894,17 @@ You review code."#;
             .contains_key("20260204_2"));
 
         let result = client
-            .handle_load_task_result("20260204_3", false)
+            .handle_load_task_result("20260204_3", false, false)
             .await
             .unwrap();
-        let text = extract_text(&result[0]);
+        let text = extract_text(&result.content[0]);
         assert!(text.contains("✗ Failed"));
         assert!(text.contains("Error: Something went wrong"));
+        assert_eq!(result.status, "failed");
 
-        let result = client.handle_load_task_result("20260204_3", false).await;
+        let result = client
+            .handle_load_task_result("20260204_3", false, false)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
 
@@ -2891,18 +2938,114 @@ You review code."#;
         }
 
         let result = client
-            .handle_load_task_result("20260204_1", true)
+            .handle_load_task_result("20260204_1", true, false)
             .await
             .unwrap();
-        let text = extract_text(&result[0]);
+        let text = extract_text(&result.content[0]);
         assert!(text.contains("Cancelled"));
         assert!(text.contains("20260204_1"));
         assert!(text.contains("Cancellable task"));
+        assert_eq!(result.status, "cancelled");
+        assert_eq!(result.turns, Some(3));
         assert!(token.is_cancelled());
         assert!(!client
             .background_tasks
             .lock()
             .await
             .contains_key("20260204_1"));
+    }
+
+    #[tokio::test]
+    async fn test_peek_running_task() {
+        let client = SummonClient::new(create_test_context()).unwrap();
+
+        {
+            let mut running = client.background_tasks.lock().await;
+            running.insert(
+                "20260204_1".to_string(),
+                BackgroundTask {
+                    id: "20260204_1".to_string(),
+                    description: "Long running analysis".to_string(),
+                    started_at: Instant::now(),
+                    turns: Arc::new(AtomicU32::new(7)),
+                    last_activity: Arc::new(AtomicU64::new(current_epoch_millis())),
+                    handle: tokio::spawn(async {
+                        tokio::time::sleep(Duration::from_secs(1000)).await;
+                        Ok("eventual result".to_string())
+                    }),
+                    cancellation_token: CancellationToken::new(),
+                    notification_buffer: Arc::new(Mutex::new(Vec::new())),
+                },
+            );
+        }
+
+        // Peek should return status without removing the task
+        let result = client
+            .handle_load_task_result("20260204_1", false, true)
+            .await
+            .unwrap();
+        let text = extract_text(&result.content[0]);
+        assert!(text.contains("Running"));
+        assert!(text.contains("Long running analysis"));
+        assert!(text.contains("7")); // turns taken
+
+        // Task should still be in background_tasks (not consumed)
+        assert!(client
+            .background_tasks
+            .lock()
+            .await
+            .contains_key("20260204_1"));
+    }
+
+    #[tokio::test]
+    async fn test_peek_nonexistent_task() {
+        let client = SummonClient::new(create_test_context()).unwrap();
+
+        let result = client
+            .handle_load_task_result("20260204_999", false, true)
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_peek_completed_task_returns_result() {
+        let client = SummonClient::new(create_test_context()).unwrap();
+
+        {
+            let mut completed = client.completed_tasks.lock().await;
+            completed.insert(
+                "20260204_1".to_string(),
+                CompletedTask {
+                    id: "20260204_1".to_string(),
+                    description: "Finished task".to_string(),
+                    result: Ok("final output".to_string()),
+                    turns_taken: 4,
+                    duration: Duration::from_secs(30),
+                    completed_at: Instant::now(),
+                },
+            );
+        }
+
+        // Peek on a completed task should return the full result (same as non-peek)
+        let result = client
+            .handle_load_task_result("20260204_1", false, true)
+            .await
+            .unwrap();
+        let text = extract_text(&result.content[0]);
+        assert!(text.contains("Completed"));
+        assert!(text.contains("final output"));
+
+        // Peek must be non-destructive: the result is still retrievable afterwards.
+        assert!(client
+            .completed_tasks
+            .lock()
+            .await
+            .contains_key("20260204_1"));
+        let result = client
+            .handle_load_task_result("20260204_1", false, false)
+            .await
+            .unwrap();
+        assert!(extract_text(&result.content[0]).contains("final output"));
     }
 }

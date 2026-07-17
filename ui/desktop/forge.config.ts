@@ -2,9 +2,11 @@ const { FusesPlugin } = require('@electron-forge/plugin-fuses');
 const { FuseV1Options, FuseVersion } = require('@electron/fuses');
 const { resolve } = require('path');
 
+const isLinuxVulkanBuild = process.env.GOOSE_DESKTOP_LINUX_VARIANT === 'vulkan';
+
 let cfg = {
   asar: true,
-  extraResource: ['src/bin', 'src/images'],
+  extraResource: ['src/bin', 'src/images', 'src/app-update.yml'],
   icon: 'src/images/icon',
   // Windows specific configuration
   win32: {
@@ -33,10 +35,10 @@ let cfg = {
       },
     ],
     // Usage descriptions for macOS TCC (Transparency, Consent, and Control)
-    NSCalendarsUsageDescription:
-      'Goose needs access to your calendars to help manage and query calendar events.',
-    NSRemindersUsageDescription:
-      'Goose needs access to your reminders to help manage and query reminders.',
+    NSMicrophoneUsageDescription:
+      'Goose needs access to your microphone for voice dictation.',
+    NSAppleEventsUsageDescription:
+      'Goose needs access to send Apple Events to control other apps on your behalf.',
   },
 };
 
@@ -63,7 +65,7 @@ module.exports = {
       name: '@electron-forge/publisher-github',
       config: {
         repository: {
-          owner: process.env.GITHUB_OWNER || 'block',
+          owner: process.env.GITHUB_OWNER || 'aaif-goose',
           name: process.env.GITHUB_REPO || 'goose',
         },
         prerelease: false,
@@ -87,13 +89,14 @@ module.exports = {
       config: {
         name: 'Goose',
         bin: 'Goose',
-        maintainer: 'Block, Inc.',
-        homepage: 'https://block.github.io/goose/',
+        maintainer: 'AAIF (Agentic AI Foundation)',
+        homepage: 'https://goose-docs.ai/',
         categories: ['Development'],
         desktopTemplate: './forge.deb.desktop',
         options: {
           icon: 'src/images/icon.png',
           prefix: '/opt',
+          ...(isLinuxVulkanBuild ? { depends: ['libvulkan1'] } : {}),
         },
       },
     },
@@ -102,14 +105,14 @@ module.exports = {
       config: {
         name: 'Goose',
         bin: 'Goose',
-        maintainer: 'Block, Inc.',
-        homepage: 'https://block.github.io/goose/',
+        maintainer: 'AAIF (Agentic AI Foundation)',
+        homepage: 'https://goose-docs.ai/',
         categories: ['Development'],
         desktopTemplate: './forge.rpm.desktop',
         options: {
           icon: 'src/images/icon.png',
           prefix: '/opt',
-          fpm: ['--rpm-rpmbuild-define', '_build_id_links none'],
+          ...(isLinuxVulkanBuild ? { requires: ['vulkan-loader'] } : {}),
         },
       },
     },
@@ -117,13 +120,14 @@ module.exports = {
       name: '@electron-forge/maker-flatpak',
       config: {
         options: {
-          id: 'io.github.block.Goose',
+          id: 'io.github.block.Goose', // NOTE: kept for backwards compat with existing installs
           categories: ['Development'],
+          mimeType: ['x-scheme-handler/goose'],
           icon: {
             scalable: 'src/images/icon.svg',
             '512x512': 'src/images/icon-512.png',
           },
-          homepage: 'https://block.github.io/goose/',
+          homepage: 'https://goose-docs.ai/',
           runtimeVersion: '25.08',
           baseVersion: '25.08',
           bin: 'Goose',
@@ -139,6 +143,15 @@ module.exports = {
                 'ln -s $(find /usr/lib -name "libbz2.so.1" | head -n 1) /app/lib/libbz2.so.1.0',
               ],
             },
+            {
+              name: 'git',
+              buildsystem: 'simple',
+              'build-commands': [
+                'mkdir -p /app/bin /app/libexec/git-core',
+                'cp /usr/bin/git /app/bin/git',
+                'cp /usr/libexec/git-core/git-remote-https /app/libexec/git-core/git-remote-https 2>/dev/null || true',
+              ],
+            },
           ],
           finishArgs: [
             '--share=ipc',
@@ -152,6 +165,7 @@ module.exports = {
             '--socket=system-bus',
             // This ensures the app looks in our shim folder first
             '--env=LD_LIBRARY_PATH=/app/lib',
+            '--env=GIT_EXEC_PATH=/app/libexec/git-core',
           ],
         },
       },

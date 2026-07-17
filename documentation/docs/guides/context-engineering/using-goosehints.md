@@ -6,7 +6,7 @@ sidebar_label: Using goosehints
 
 import Tabs from '@theme/Tabs';
 import TabItem from '@theme/TabItem';
-import { PanelLeft } from 'lucide-react';
+import { Menu } from 'lucide-react';
 
 `.goosehints` is a text file used to provide additional context about your project and improve the communication with goose. The use of `.goosehints` ensures that goose understands your requirements better and can execute tasks more effectively.
 
@@ -51,7 +51,7 @@ You can use other agent rule files with goose by using the [`CONTEXT_FILE_NAMES`
     #### Local hints file
 
     1. Click the directory path at the bottom of the app and open the directory where you want to create the file
-    2. Click the <PanelLeft className="inline" size={16} /> button in the top-left to open the sidebar
+    2. Click the hamburger button <Menu className="inline" size={16} /> in the top-left to open the sidebar
     3. Click `Settings` in the sidebar
     4. Click `Chat`
     5. Scroll down to the `Project Hints (.goosehints)` section and click `Configure`
@@ -151,8 +151,6 @@ If you start goose in `my-project/`, the root-level hints are loaded immediately
         Use conventional commits for all changes.
         ```
    </details>
-
-After nested hints are loaded for a directory, they remain active for the rest of the session. If you update a hint file and want goose to pick up the new content reliably, restart the session.
 2. <details>
      <summary>`frontend/.goosehints`</summary>
         ```
@@ -179,7 +177,7 @@ After nested hints are loaded for a directory, they remain active for the rest o
 
         Always confirm UI changes with design team before implementation.
         ```
-   </details> 
+   </details>
 3. <details>
      <summary>`frontend/components/.goosehints` (current directory)</summary>
         ```
@@ -194,6 +192,10 @@ After nested hints are loaded for a directory, they remain active for the rest o
         - Follow naming convention: PascalCase
         ```
    </details>
+
+:::note
+After nested hints are loaded for a directory, they remain active for the rest of the session. If you update a hint file and want goose to pick up the new content reliably, restart the session.
+:::
 
 ## Common Use Cases
 Here are some ways people have used hints to provide additional context to goose:

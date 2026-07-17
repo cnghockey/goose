@@ -2,6 +2,7 @@ import { useMemo, useRef } from 'react';
 import ImagePreview from './ImagePreview';
 import { formatMessageTimestamp } from '../utils/timeUtils';
 import MarkdownContent from './MarkdownContent';
+import ThinkingContent from './ThinkingContent';
 import ToolCallWithResponse from './ToolCallWithResponse';
 import {
   getTextAndImageContent,
@@ -14,11 +15,12 @@ import {
   getAnyToolConfirmationData,
   ToolConfirmationData,
   NotificationEvent,
+  type Message,
 } from '../types/message';
-import { Message } from '../api';
 import ToolCallConfirmation from './ToolCallConfirmation';
 import ElicitationRequest from './ElicitationRequest';
 import MessageCopyLink from './MessageCopyLink';
+import MessageUsageStats from './MessageUsageStats';
 import { cn } from '../utils';
 import { identifyConsecutiveToolCalls, shouldHideTimestamp } from '../utils/toolCallChaining';
 
@@ -33,7 +35,7 @@ interface GooseMessageProps {
   submitElicitationResponse?: (
     elicitationId: string,
     userData: Record<string, unknown>
-  ) => Promise<void>;
+  ) => Promise<boolean>;
 }
 
 export default function GooseMessage({
@@ -47,26 +49,8 @@ export default function GooseMessage({
 }: GooseMessageProps) {
   const contentRef = useRef<HTMLDivElement | null>(null);
 
-  let { textContent, imagePaths } = getTextAndImageContent(message);
+  const { textContent: displayText, imagePaths } = getTextAndImageContent(message);
   const thinkingContent = getThinkingContent(message);
-
-  const splitChainOfThought = (text: string): { displayText: string; cotText: string | null } => {
-    const regex = /<think>([\s\S]*?)<\/think>/i;
-    const match = text.match(regex);
-    if (!match) {
-      return { displayText: text, cotText: null };
-    }
-
-    const cotRaw = match[1].trim();
-    const displayText = text.replace(regex, '').trim();
-
-    return {
-      displayText,
-      cotText: cotRaw || null,
-    };
-  };
-
-  const { displayText, cotText } = splitChainOfThought(textContent);
 
   const timestamp = useMemo(() => formatMessageTimestamp(message.created), [message.created]);
   const toolRequests = getToolRequests(message);
@@ -92,6 +76,13 @@ export default function GooseMessage({
   );
   const hasToolConfirmation = toolConfirmationContent !== undefined;
   const hasElicitation = elicitationContent !== undefined;
+  const elicitationData =
+    elicitationContent?.data.actionType === 'elicitation'
+      ? (elicitationContent.data as typeof elicitationContent.data & {
+          isSubmitted?: boolean;
+          isCancelled?: boolean;
+        })
+      : undefined;
 
   const toolConfirmationShownInline = useMemo(() => {
     if (!toolConfirmationContent) return false;
@@ -132,15 +123,15 @@ export default function GooseMessage({
     <div className="goose-message flex w-[90%] justify-start min-w-0">
       <div className="flex flex-col w-full min-w-0">
         {thinkingContent && (
-          <div className="mb-2 text-xs text-gray-400/70 italic">
-            <MarkdownContent content={thinkingContent} />
-          </div>
-        )}
-
-        {cotText && (
-          <div className="mb-2 text-sm text-gray-400 italic">
-            <MarkdownContent content={cotText} />
-          </div>
+          <ThinkingContent
+            content={thinkingContent}
+            isExpanded={
+              isStreaming &&
+              !displayText.trim() &&
+              imagePaths.length === 0 &&
+              toolRequests.length === 0
+            }
+          />
         )}
 
         {(displayText.trim() || imagePaths.length > 0) && (
@@ -160,7 +151,7 @@ export default function GooseMessage({
             )}
 
             {toolRequests.length === 0 && (
-              <div className="relative flex justify-start">
+              <div className="relative flex items-center justify-between">
                 {!isStreaming && (
                   <div className="text-xs font-mono text-text-secondary pt-1 transition-all duration-200 group-hover:-translate-y-4 group-hover:opacity-0">
                     {timestamp}
@@ -171,6 +162,11 @@ export default function GooseMessage({
                     <MessageCopyLink text={displayText} contentRef={contentRef} />
                   </div>
                 )}
+                {!isStreaming && message.metadata.usage && (
+                  <div className="pt-1 transition-all duration-200 opacity-0 group-hover:opacity-100 -translate-y-4 group-hover:translate-y-0">
+                    <MessageUsageStats usage={message.metadata.usage} />
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -178,7 +174,7 @@ export default function GooseMessage({
 
         {toolRequests.length > 0 && (
           <div className={cn(displayText && 'mt-2')}>
-            <div className="relative flex flex-col w-full">
+            <div className="relative flex flex-col w-full group">
               <div className="flex flex-col gap-3">
                 {toolRequests.map((toolRequest) => {
                   const hasResponse = toolResponsesMap.has(toolRequest.id);
@@ -203,8 +199,21 @@ export default function GooseMessage({
                   );
                 })}
               </div>
-              <div className="text-xs text-text-secondary transition-all duration-200 group-hover:-translate-y-4 group-hover:opacity-0 pt-1">
-                {!isStreaming && !hideTimestamp && timestamp}
+              <div className="flex items-center justify-between">
+                <div
+                  className={cn(
+                    'text-xs text-text-secondary pt-1',
+                    message.metadata.usage &&
+                      'transition-all duration-200 group-hover:-translate-y-4 group-hover:opacity-0'
+                  )}
+                >
+                  {!isStreaming && !hideTimestamp && timestamp}
+                </div>
+                {!isStreaming && message.metadata.usage && (
+                  <div className="pt-1 transition-all duration-200 opacity-0 group-hover:opacity-100 -translate-y-4 group-hover:translate-y-0">
+                    <MessageUsageStats usage={message.metadata.usage} />
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -220,8 +229,8 @@ export default function GooseMessage({
 
         {hasElicitation && submitElicitationResponse && (
           <ElicitationRequest
-            isCancelledMessage={false}
-            isClicked={false}
+            isCancelledMessage={elicitationData?.isCancelled === true}
+            isClicked={elicitationData?.isSubmitted === true}
             actionRequiredContent={elicitationContent}
             onSubmit={submitElicitationResponse}
           />

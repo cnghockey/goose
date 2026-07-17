@@ -2,15 +2,14 @@ use crate::session::SESSION_ID_HEADER;
 use crate::ExpectedSessionId;
 use rmcp::model::{
     CallToolResult, ClientNotification, ClientRequest, Content, ErrorCode, Implementation,
-    InitializeResult, Meta, ProtocolVersion, ServerCapabilities, ServerInfo,
+    InitializeResult, Meta, ProtocolVersion, Role, ServerCapabilities, ServerInfo,
 };
 use rmcp::service::{DynService, NotificationContext, RequestContext, ServiceExt, ServiceRole};
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 use rmcp::{
-    handler::server::router::tool::ToolRouter, tool, tool_handler, tool_router,
-    ErrorData as McpError, RoleServer, ServerHandler, Service,
+    tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler, Service,
 };
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -88,23 +87,13 @@ impl<S: Service<RoleServer>> Service<RoleServer> for ValidatingService<S> {
     }
 }
 
-#[derive(Clone)]
-pub struct McpFixtureServer {
-    tool_router: ToolRouter<McpFixtureServer>,
-}
-
-impl Default for McpFixtureServer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+#[derive(Clone, Default)]
+pub struct McpFixtureServer;
 
 #[tool_router]
 impl McpFixtureServer {
     pub fn new() -> Self {
-        Self {
-            tool_router: Self::tool_router(),
-        }
+        Self
     }
 
     #[tool(description = "Get the code", annotations(read_only_hint = true))]
@@ -119,6 +108,17 @@ impl McpFixtureServer {
             "image/png",
         )]))
     }
+
+    #[tool(
+        description = "Get audience-scoped content",
+        annotations(read_only_hint = true)
+    )]
+    fn get_audience_content(&self) -> Result<CallToolResult, McpError> {
+        Ok(CallToolResult::success(vec![
+            Content::text("visible"),
+            Content::text("provider-only").with_audience(vec![Role::Assistant]),
+        ]))
+    }
 }
 
 #[tool_handler]
@@ -127,7 +127,7 @@ impl ServerHandler for McpFixtureServer {
         InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2025_03_26)
             .with_server_info(Implementation::new("mcp-fixture", "1.0.0"))
-            .with_instructions("Test server with get_code and get_image tools.")
+            .with_instructions("Test server with code, image, and audience-scoped content tools.")
     }
 }
 

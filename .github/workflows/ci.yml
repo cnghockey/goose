@@ -20,10 +20,10 @@ jobs:
       code: ${{ steps.filter.outputs.code }}
     steps:
       - name: Checkout Code
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Check for file changes
-        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # pin@v3
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # pin@v3
         id: filter
         with:
           filters: |
@@ -39,9 +39,11 @@ jobs:
     if: needs.changes.outputs.code == 'true' || github.event_name != 'pull_request'
     steps:
       - name: Checkout Code
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
-      - uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606  # v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
 
       - name: Run cargo fmt
         run: cargo fmt --check
@@ -53,17 +55,14 @@ jobs:
     if: needs.changes.outputs.code == 'true' || github.event_name != 'pull_request'
     steps:
       - name: Checkout Code
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
-      - uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606  # v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       - name: Install Dependencies
         run: |
           sudo apt update -y
           sudo apt install -y libdbus-1-dev gnome-keyring libxcb1-dev
-
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
 
       - name: Build and Test
         run: |
@@ -75,6 +74,44 @@ jobs:
         env:
           RUST_MIN_STACK: 8388608
 
+  rust-build-and-test-tls:
+    name: Build and Test TLS Backend (${{ matrix.tls-feature }})
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        tls-feature:
+          - rustls-tls
+          - native-tls
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Install Dependencies
+        run: |
+          sudo apt update -y
+          sudo apt install -y libdbus-1-dev gnome-keyring libxcb1-dev
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          key: ${{ matrix.tls-feature }}
+
+      - name: Build and Test with ${{ matrix.tls-feature }}
+        run: |
+          gnome-keyring-daemon --components=secrets --daemonize --unlock <<< 'foobar'
+          export CARGO_INCREMENTAL=0
+          cargo test -p goose --no-default-features --features ${{ matrix.tls-feature }},code-mode
+          cargo test -p goose-providers --no-default-features --features ${{ matrix.tls-feature }}
+          cargo test -p goose-cli --no-default-features --features ${{ matrix.tls-feature }},code-mode -- --skip scenario_tests::scenarios::tests
+          cargo test -p goose-cli --no-default-features --features ${{ matrix.tls-feature }},code-mode --jobs 1 scenario_tests::scenarios::tests
+        env:
+          RUST_MIN_STACK: 8388608
+
 
   rust-build-windows:
     name: Build Rust Project on Windows
@@ -82,10 +119,10 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - name: Checkout Code
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
         with:
           key: windows-ci
 
@@ -100,17 +137,48 @@ jobs:
         env:
           CARGO_INCREMENTAL: "0"
 
+  rust-msrv:
+    name: Check MSRV
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          if [ -z "$msrv" ]; then
+            echo "Could not find rust-version in workspace Cargo.toml" >&2
+            exit 1
+          fi
+          echo "msrv=$msrv" >> "$GITHUB_OUTPUT"
+          echo "MSRV: $msrv"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659  # v1
+        with:
+          toolchain: ${{ steps.msrv.outputs.msrv }}
+
+      - name: Install Dependencies
+        run: |
+          sudo apt update -y
+          sudo apt install -y libdbus-1-dev libxcb1-dev
+
+      - name: Check with MSRV toolchain
+        run: cargo check --workspace --locked --all-targets
+        env:
+          CARGO_INCREMENTAL: "0"
+
   rust-lint:
     name: Lint Rust Code
     runs-on: ubuntu-latest
     needs: changes
     if: needs.changes.outputs.code == 'true' || github.event_name != 'pull_request'
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
-      - uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606  # v1
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       - name: Lint
         run: |
@@ -121,34 +189,39 @@ jobs:
           export CARGO_INCREMENTAL=0
           cargo clippy --workspace --all-targets --exclude v8 -- -D warnings
 
-  openapi-schema-check:
-    name: Check OpenAPI Schema is Up-to-Date
+  schema-check:
+    name: Check Generated Schemas are Up-to-Date
     runs-on: ubuntu-latest
     needs: changes
     if: needs.changes.outputs.code == 'true' || github.event_name != 'pull_request'
     steps:
       - name: Checkout Code
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
-      - uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606  # v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       - name: Install Dependencies
         run: |
           sudo apt update -y
           sudo apt install -y libdbus-1-dev libxcb1-dev
 
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
-
-      - name: Install Node.js Dependencies for OpenAPI Check
-        run: source ../../bin/activate-hermit && pnpm install --frozen-lockfile
-        working-directory: ui/desktop
-
-      - name: Check OpenAPI Schema is Up-to-Date
+      - name: Install Node.js Dependencies
         run: |
           source ./bin/activate-hermit
-          hermit uninstall rustup
-          just check-openapi-schema
+          cd ui/desktop && pnpm install --frozen-lockfile
+          cd ../sdk && pnpm install --frozen-lockfile
+
+      - name: Check ACP Schema is Up-to-Date
+        run: |
+          source ./bin/activate-hermit
+          just check-acp-schema
+
+      - name: Test ACP Client SDK
+        run: |
+          source ./bin/activate-hermit
+          cd ui/sdk
+          pnpm test
+          pnpm run typecheck:test
 
   desktop-lint:
     name: Test and Lint Electron Desktop App
@@ -157,20 +230,7 @@ jobs:
     if: needs.changes.outputs.code == 'true' || github.event_name != 'pull_request'
     steps:
       - name: Checkout Code
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
-
-      # Temporarily disabled due to GitHub Actions bug on macOS runners
-      # https://github.com/actions/runner-images/issues/13341
-      # https://github.com/actions/runner/issues/4134
-      # - name: Cache pnpm dependencies
-      #   uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7  # v5.0.2
-      #   with:
-      #     path: |
-      #       ui/desktop/node_modules
-      #       .hermit/node/cache
-      #     key: ci-pnpm-cache-v1-${{ runner.os }}-${{ hashFiles('ui/pnpm-lock.yaml') }}
-      #     restore-keys: |
-      #       ci-pnpm-cache-v1-${{ runner.os }}-
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install Dependencies
         run: source ../../bin/activate-hermit && pnpm install --frozen-lockfile

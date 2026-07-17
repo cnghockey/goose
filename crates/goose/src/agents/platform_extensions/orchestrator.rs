@@ -2,11 +2,14 @@ use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::mcp_client::{Error, McpClientTrait};
 use crate::agents::tool_execution::ToolCallContext;
 use crate::agents::{AgentEvent, SessionConfig};
-use crate::config::GooseMode;
+use crate::config::{Config, ExtensionConfig, GooseMode};
 use crate::context_mgmt::format_message_for_compacting;
 use crate::conversation::message::Message;
+use crate::conversation::Conversation;
 use crate::execution::manager::AgentManager;
+use crate::providers;
 use crate::providers::base::Provider;
+use crate::session::extension_data::EnabledExtensionsState;
 use crate::session::session_manager::SessionType;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -139,6 +142,26 @@ impl OrchestratorClient {
             .ok_or_else(|| "Provider not available".to_string())
     }
 
+    async fn parent_model_config(
+        &self,
+        provider_name: &str,
+    ) -> Result<goose_providers::model::ModelConfig, String> {
+        if let Some(session) = self.context.session.as_ref() {
+            return self.context.model_config_for_session(&session.id).await;
+        }
+
+        let model_name = Config::global()
+            .get_goose_model()
+            .map_err(|_| "Could not resolve model config: missing model".to_string())?;
+        crate::model_config::model_config_from_user_config(provider_name, &model_name)
+            .map_err(|e| format!("Could not resolve model config: {e}"))
+    }
+
+    fn parent_extensions(&self) -> Vec<ExtensionConfig> {
+        let extension_data = self.context.session.as_ref().map(|s| &s.extension_data);
+        EnabledExtensionsState::extensions_or_default(extension_data, Config::global())
+    }
+
     async fn handle_list_sessions(
         &self,
         arguments: Option<JsonObject>,
@@ -175,7 +198,7 @@ impl OrchestratorClient {
         };
 
         // Most recent first
-        sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
         let total = sessions.len();
         sessions.truncate(limit);
 
@@ -260,7 +283,7 @@ impl OrchestratorClient {
         match mode {
             "first_last" => {
                 if let Some(conversation) = &session.conversation {
-                    let messages = conversation.messages();
+                    let messages = agent_visible_session_messages(conversation);
                     if messages.is_empty() {
                         output.push("No messages in this session.".to_string());
                     } else {
@@ -313,9 +336,9 @@ impl OrchestratorClient {
     ) -> Result<String, String> {
         let provider = self.get_provider().await?;
 
-        let conversation_text = messages
+        let conversation_text = Conversation::new_unvalidated(messages.iter().cloned())
+            .agent_visible_messages()
             .iter()
-            .filter(|m| m.is_agent_visible())
             .map(format_message_for_compacting)
             .collect::<Vec<_>>()
             .join("\n");
@@ -330,10 +353,17 @@ impl OrchestratorClient {
             conversation_text
         ));
 
-        let (response, _usage) = provider
-            .complete_fast(session_id, system, &[user_message], &[])
-            .await
-            .map_err(|e| format!("LLM summarization failed: {}", e))?;
+        let model_config = self.parent_model_config(provider.get_name()).await?;
+        let (response, _usage) = crate::model_config::complete_fast(
+            provider.as_ref(),
+            &model_config,
+            session_id,
+            system,
+            &[user_message],
+            &[],
+        )
+        .await
+        .map_err(|e| format!("LLM summarization failed: {}", e))?;
 
         Ok(response
             .content
@@ -397,10 +427,14 @@ impl OrchestratorClient {
             .await
             .map_err(|e| format!("Failed to create agent: {}", e))?;
 
-        // Inherit the orchestrator's provider and model
-        let provider = self.get_provider().await?;
+        let parent_provider = self.get_provider().await?;
+        let extensions = self.parent_extensions();
+        let model_config = self.parent_model_config(parent_provider.get_name()).await?;
+        let provider = providers::create(parent_provider.get_name(), extensions)
+            .await
+            .map_err(|e| format!("Failed to create provider for new agent: {}", e))?;
         agent
-            .update_provider(provider, &session.id)
+            .update_provider(provider, model_config, &session.id)
             .await
             .map_err(|e| format!("Failed to set provider on new agent: {}", e))?;
 
@@ -432,11 +466,17 @@ impl OrchestratorClient {
             .map_err(|e| format!("Failed to get agent for session '{}': {}", session_id, e))?;
 
         if agent.provider().await.is_err() {
-            if let Ok(provider) = self.get_provider().await {
-                agent
-                    .update_provider(provider, &session_id)
-                    .await
-                    .map_err(|e| format!("Failed to set provider: {}", e))?;
+            if let Ok(parent_provider) = self.get_provider().await {
+                let extensions = self.parent_extensions();
+                let model_config = self.parent_model_config(parent_provider.get_name()).await?;
+                if let Ok(provider) =
+                    providers::create(parent_provider.get_name(), extensions).await
+                {
+                    agent
+                        .update_provider(provider, model_config, &session_id)
+                        .await
+                        .map_err(|e| format!("Failed to set provider: {}", e))?;
+                }
             }
         }
 
@@ -537,6 +577,10 @@ impl OrchestratorClient {
     }
 }
 
+fn agent_visible_session_messages(conversation: &Conversation) -> Vec<Message> {
+    conversation.agent_visible_messages()
+}
+
 #[async_trait]
 impl McpClientTrait for OrchestratorClient {
     async fn list_tools(
@@ -632,4 +676,39 @@ fn extract_string(args: &JsonObject, key: &str) -> Result<String, String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| format!("Missing or invalid '{}'", key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conversation::message::MessageContent;
+    use rmcp::model::{AnnotateAble, RawTextContent, Role};
+
+    #[test]
+    fn first_last_projection_drops_hidden_endpoints_and_content() {
+        let user_only = |text: &str| {
+            MessageContent::Text(
+                RawTextContent {
+                    text: text.to_string(),
+                    meta: None,
+                }
+                .no_annotation()
+                .with_audience(vec![Role::User]),
+            )
+        };
+        let conversation = Conversation::new_unvalidated([
+            Message::assistant().with_content(user_only("hidden first")),
+            Message::user().with_text("visible first"),
+            Message::assistant()
+                .with_content(user_only("hidden block"))
+                .with_text("visible last"),
+            Message::assistant().with_content(user_only("hidden last")),
+        ]);
+
+        let messages = agent_visible_session_messages(&conversation);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].as_concat_text(), "visible first");
+        assert_eq!(messages[1].as_concat_text(), "visible last");
+    }
 }

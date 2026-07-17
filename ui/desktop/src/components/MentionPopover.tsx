@@ -8,14 +8,18 @@ import {
   useState,
 } from 'react';
 import { ItemIcon } from './ItemIcon';
-import { CommandType, getSlashCommands } from '../api';
 import { getInitialWorkingDir } from '../utils/workingDir';
 import { defineMessages, useIntl } from '../i18n';
+import { listAgentMentionItems, listSlashCommandItems } from '../acp/autocomplete';
 
 const i18n = defineMessages({
   scanningFiles: {
     id: 'mentionPopover.scanningFiles',
     defaultMessage: 'Scanning files...',
+  },
+  loadingCommands: {
+    id: 'mentionPopover.loadingCommands',
+    defaultMessage: 'Loading commands...',
   },
   itemsFound: {
     id: 'mentionPopover.itemsFound',
@@ -25,16 +29,22 @@ const i18n = defineMessages({
     id: 'mentionPopover.noItemsFound',
     defaultMessage: 'No items found matching "{query}"',
   },
+  noCommandsFound: {
+    id: 'mentionPopover.noCommandsFound',
+    defaultMessage: 'No commands found matching "{query}"',
+  },
 });
 
-type DisplayItemType = CommandType | 'Directory' | 'File';
+type CommandItemType = 'Builtin' | 'Recipe' | 'Skill' | 'Agent';
+type DisplayItemType = CommandItemType | 'Directory' | 'File';
 
 const typeOrder: Record<DisplayItemType, number> = {
-  Directory: 0,
-  File: 1,
-  Builtin: 2,
-  Skill: 3,
-  Recipe: 4,
+  Agent: 0,
+  Directory: 1,
+  File: 2,
+  Builtin: 3,
+  Skill: 4,
+  Recipe: 5,
 };
 
 export interface DisplayItem {
@@ -42,6 +52,7 @@ export interface DisplayItem {
   extra: string;
   itemType: DisplayItemType;
   relativePath: string;
+  insertText?: string;
 }
 
 export interface DisplayItemWithMatch extends DisplayItem {
@@ -60,6 +71,7 @@ interface MentionPopoverProps {
   selectedIndex: number;
   onSelectedIndexChange: (index: number) => void;
   workingDir?: string;
+  sessionId?: string | null;
 }
 
 // Enhanced fuzzy matching algorithm
@@ -141,6 +153,7 @@ const MentionPopover = forwardRef<
       selectedIndex,
       onSelectedIndexChange,
       workingDir,
+      sessionId,
     },
     ref
   ) => {
@@ -374,30 +387,11 @@ const MentionPopover = forwardRef<
       []
     );
 
-    const scanFilesFromRoot = useCallback(async () => {
-      setIsLoading(true);
-      try {
-        let startPath = currentWorkingDir;
-
-        if (!startPath) {
-          if (window.electron.platform === 'win32') {
-            startPath = 'C:\\Users';
-          } else if (window.electron.platform === 'linux') {
-            startPath = '/home';
-          } else {
-            startPath = '/Users'; // Default to macOS
-          }
-        }
-
-        const scannedFiles = await scanDirectoryFromRoot(startPath);
-        setItems(scannedFiles);
-      } catch (error) {
-        console.error('Error scanning items from root:', error);
-        setItems([]);
-      } finally {
-        setIsLoading(false);
-      }
-    }, [scanDirectoryFromRoot, currentWorkingDir]);
+    const getDefaultStartPath = (): string => {
+      if (window.electron.platform === 'win32') return 'C:\\Users';
+      if (window.electron.platform === 'linux') return '/home';
+      return '/Users';
+    };
 
     const compareByType = (a: DisplayItemWithMatch, b: DisplayItemWithMatch) => {
       const orderA = typeOrder[a.itemType] ?? Number.MAX_SAFE_INTEGER;
@@ -437,7 +431,9 @@ const MentionPopover = forwardRef<
           );
 
           let finalScore = bestMatch.score;
-          if (finalScore > 0 && currentWorkingDir) {
+          if (finalScore > 0 && file.itemType === 'Agent') {
+            finalScore += 100;
+          } else if (finalScore > 0 && currentWorkingDir) {
             const depth = file.extra.replace(currentWorkingDir, '').split('/').length - 1;
             finalScore += depth <= 1 ? 50 : depth <= 2 ? 30 : depth <= 3 ? 15 : 0;
           }
@@ -460,10 +456,13 @@ const MentionPopover = forwardRef<
     }, [items, query, currentWorkingDir]);
 
     const getSelectionText = (item: DisplayItem): string => {
-      if (item.itemType === 'Skill') {
-        return `Use the ${item.name} skill to `;
+      if (item.insertText) {
+        return item.insertText;
       }
-      if (['Builtin', 'Recipe'].includes(item.itemType)) {
+      if (item.itemType === 'Agent') {
+        return '@' + item.name + ' ';
+      }
+      if (['Builtin', 'Recipe', 'Skill'].includes(item.itemType)) {
         return '/' + item.name;
       }
       return item.extra;
@@ -485,28 +484,45 @@ const MentionPopover = forwardRef<
     );
 
     useEffect(() => {
+      let cancelled = false;
+
       const loadData = async () => {
-        if (isSlashCommand) {
-          const response = await getSlashCommands({
-            query: { working_dir: currentWorkingDir },
-            throwOnError: true,
-          });
-          const commandItems: DisplayItem[] = (response.data?.commands || []).map((cmd) => ({
-            name: cmd.command,
-            extra: cmd.help,
-            itemType: cmd.command_type,
-            relativePath: cmd.command,
-          }));
-          setItems(commandItems);
-        } else {
-          await scanFilesFromRoot();
+        setItems([]);
+        setIsLoading(true);
+        try {
+          if (isSlashCommand) {
+            const commandItems = await listSlashCommandItems(currentWorkingDir);
+            if (cancelled) return;
+            setItems(commandItems);
+          } else {
+            // Fetch agents from server and scan files in parallel
+            const [agentItems, scannedFiles] = await Promise.all([
+              listAgentMentionItems(currentWorkingDir, sessionId ?? undefined).catch(() => []),
+              scanDirectoryFromRoot(currentWorkingDir || getDefaultStartPath()),
+            ]);
+            if (cancelled) return;
+            setItems([...agentItems, ...scannedFiles]);
+          }
+        } catch (error) {
+          if (!cancelled) {
+            console.error('Error loading popover items:', error);
+            setItems([]);
+          }
+        } finally {
+          if (!cancelled) {
+            setIsLoading(false);
+          }
         }
       };
 
       if (isOpen) {
         loadData();
       }
-    }, [isOpen, isSlashCommand, scanFilesFromRoot, currentWorkingDir]);
+
+      return () => {
+        cancelled = true;
+      };
+    }, [isOpen, isSlashCommand, scanDirectoryFromRoot, currentWorkingDir, sessionId]);
 
     useEffect(() => {
       const handleClickOutside = (event: MouseEvent) => {
@@ -561,7 +577,9 @@ const MentionPopover = forwardRef<
           {isLoading ? (
             <div className="flex items-center justify-center py-4">
               <div className="animate-spin rounded-full h-4 w-4 border-t-2 border-b-2"></div>
-              <span className="ml-2 text-sm text-text-secondary">{intl.formatMessage(i18n.scanningFiles)}</span>
+              <span className="ml-2 text-sm text-text-secondary">
+                {intl.formatMessage(isSlashCommand ? i18n.loadingCommands : i18n.scanningFiles)}
+              </span>
             </div>
           ) : (
             <>
@@ -577,7 +595,7 @@ const MentionPopover = forwardRef<
               >
                 {displayItems.map((item, index) => (
                   <div
-                    key={`${item.itemType}-${item.name}`}
+                    key={`${item.itemType}-${item.relativePath}-${item.extra}-${item.insertText ?? ''}`}
                     onClick={() => handleItemClick(index)}
                     data-selected={index === selectedIndex}
                     className={`flex items-center gap-3 p-2 rounded-md cursor-pointer transition-colors ${
@@ -596,7 +614,9 @@ const MentionPopover = forwardRef<
 
                 {!isLoading && displayItems.length === 0 && query && (
                   <div className="p-4 text-center text-text-secondary text-sm">
-                    {intl.formatMessage(i18n.noItemsFound, { query })}
+                    {intl.formatMessage(isSlashCommand ? i18n.noCommandsFound : i18n.noItemsFound, {
+                      query,
+                    })}
                   </div>
                 )}
               </div>

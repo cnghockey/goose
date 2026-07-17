@@ -176,6 +176,18 @@ The `extensions` field allows you to specify which Model Context Protocol (MCP) 
 - **`frontend`**: Frontend-provided tools called through the frontend
 - **`inline_python`**: Inline Python code executed using uvx. Requires `code` field; optional `dependencies` for packages.
 
+:::note Summon Extension and Subagents
+The `delegate` and `load` tools are provided by the `summon` platform extension. When a recipe specifies an explicit `extensions` block, only the listed extensions are available — default platform extensions like `summon` are not automatically included. If your recipe needs subagent delegation, add `summon` to your extensions list:
+
+```yaml
+extensions:
+  - type: platform
+    name: summon
+```
+
+Recipes that define [`sub_recipes`](/docs/guides/recipes/subrecipes) have `summon` auto-injected and do not need to list it explicitly.
+:::
+
 #### Example Extensions Configuration
 
 <Tabs groupId="format">
@@ -767,7 +779,7 @@ Built-in template parameters are automatically supported and don't need to be de
 
 ## Validation Rules
 
-Validation rules from [`validate_recipe.rs`](https://github.com/block/goose/blob/main/crates/goose/src/recipe/validate_recipe.rs) are enforced when loading recipes and used by the [`goose recipe validate`](/docs/guides/goose-cli-commands#recipe) subcommand:
+Validation rules from [`validate_recipe.rs`](https://github.com/aaif-goose/goose/blob/main/crates/goose/src/recipe/validate_recipe.rs) are enforced when loading recipes and used by the [`goose recipe validate`](/docs/guides/goose-cli-commands#recipe) subcommand:
 
 ### Recipe-Level Validation
 

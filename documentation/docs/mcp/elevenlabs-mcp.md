@@ -17,7 +17,7 @@ This tutorial covers how to add the [ElevenLabs MCP Server](https://github.com/e
 :::tip Quick Install
 <Tabs groupId="interface">
   <TabItem value="ui" label="goose Desktop" default>
-  [Launch the installer](goose://extension?cmd=uvx&arg=elevenlabs-mcp&id=elevenlabs&name=ElevenLabs&description=ElevenLabs%20voice%20synthesis%20server&env=ELEVENLABS_API_KEY)
+  [Launch the installer](goose://extension?cmd=uvx&arg=elevenlabs-mcp&id=elevenlabs-mcp&name=ElevenLabs&description=ElevenLabs%20voice%20synthesis%20server&env=ELEVENLABS_API_KEY)
   </TabItem>
   <TabItem value="cli" label="goose CLI">
   **Command**
@@ -42,7 +42,7 @@ Note that you'll need [uv](https://docs.astral.sh/uv/#installation) installed on
 <Tabs groupId="interface">
   <TabItem value="ui" label="goose Desktop" default>
     <GooseDesktopInstaller
-      extensionId="elevenlabs"
+      extensionId="elevenlabs-mcp"
       extensionName="ElevenLabs"
       description="ElevenLabs voice synthesis server"
       command="uvx"
@@ -96,7 +96,7 @@ Go goose, go goose!
 
 If that’s not amazing idk what is …
 
-🚀 to get started visit block.github.io/goose_
+🚀 to get started visit goose-docs.ai_
 
 
 ### goose Output
@@ -124,7 +124,7 @@ The script has been created and read aloud using the specified voices and style.
 Press play and hear it for yourself! 🔊
 
 <audio controls>
-  <source src="/goose/audio/elevenlabs-mcp-demo.mp3" type="audio/mpeg" />
+  <source src="/audio/elevenlabs-mcp-demo.mp3" type="audio/mpeg" />
   Your browser does not support the audio element.
 </audio>
 

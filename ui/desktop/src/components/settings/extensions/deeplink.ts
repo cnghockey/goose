@@ -1,4 +1,4 @@
-import type { ExtensionConfig } from '../../../api';
+import type { ExtensionConfig } from '../../../types/extensions';
 import { toastService } from '../../../toasts';
 import { DEFAULT_EXTENSION_TIMEOUT } from './utils';
 
@@ -19,9 +19,8 @@ function getStdioConfig(
     'jbang',
     'npx',
     'uvx',
-    'goosed',
+    'goose',
     'npx.cmd',
-    'i-ching-mcp-server',
   ];
   if (!allowedCommands.includes(cmd)) {
     toastService.handleError(
@@ -141,8 +140,8 @@ export async function addExtensionFromDeepLink(
     headerParams.length > 0
       ? Object.fromEntries(
           headerParams.map((header) => {
-            const [key, value] = header.split('=');
-            return [key, decodeURIComponent(value || '')];
+            const [key, ...rest] = header.split('=');
+            return [key, decodeURIComponent(rest.join('=') || '')];
           })
         )
       : undefined;

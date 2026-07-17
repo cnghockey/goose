@@ -1,7 +1,8 @@
-export interface ExternalGoosedConfig {
+export interface ExternalBackendConfig {
   enabled: boolean;
   url: string;
   secret: string;
+  certFingerprint?: string;
 }
 
 export interface KeyboardShortcuts {
@@ -22,29 +23,31 @@ export type DefaultKeyboardShortcuts = {
   [K in keyof KeyboardShortcuts]: string;
 };
 
-export interface SessionSharingConfig {
-  enabled: boolean;
-  baseUrl: string;
-}
+// prettier-ignore
+export type LanguageSetting =
+  | 'system' | 'en' | 'es' | 'fr' | 'de' | 'it' | 'pt' | 'id' | 'ms' | 'vi'
+  | 'hi' | 'ja' | 'ko' | 'ru' | 'tr' | 'zh-CN' | 'zh-TW';
 
 export interface Settings {
   // Desktop app settings
   showMenuBarIcon: boolean;
+  disableAutoDownload: boolean;
   showDockIcon: boolean;
   enableWakelock: boolean;
+  enableNotifications: boolean;
   spellcheckEnabled: boolean;
-  externalGoosed: ExternalGoosedConfig;
+  // Key is kept as `externalGoosed` for backward compat with persisted user settings.
+  externalGoosed: ExternalBackendConfig;
   globalShortcut?: string | null;
   keyboardShortcuts: KeyboardShortcuts;
 
   // UI preferences (migrated from localStorage)
   theme: 'dark' | 'light';
   useSystemTheme: boolean;
+  language: LanguageSetting;
   responseStyle: string;
   showPricing: boolean;
-  sessionSharing: SessionSharingConfig;
   seenAnnouncementIds: string[];
-  navExpandedWidth: number | null;
 }
 
 export type SettingKey = keyof Settings;
@@ -66,8 +69,10 @@ export const defaultKeyboardShortcuts: DefaultKeyboardShortcuts = {
 export const defaultSettings: Settings = {
   // Desktop app settings
   showMenuBarIcon: true,
+  disableAutoDownload: false,
   showDockIcon: true,
   enableWakelock: false,
+  enableNotifications: true,
   spellcheckEnabled: true,
   keyboardShortcuts: defaultKeyboardShortcuts,
   externalGoosed: {
@@ -79,14 +84,10 @@ export const defaultSettings: Settings = {
   // UI preferences
   theme: 'light',
   useSystemTheme: true,
+  language: 'system',
   responseStyle: 'concise',
   showPricing: true,
-  sessionSharing: {
-    enabled: false,
-    baseUrl: '',
-  },
   seenAnnouncementIds: [],
-  navExpandedWidth: null,
 };
 
 export function getKeyboardShortcuts(settings: Settings): KeyboardShortcuts {

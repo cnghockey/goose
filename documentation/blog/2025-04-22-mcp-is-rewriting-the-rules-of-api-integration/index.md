@@ -135,7 +135,7 @@ Q: **How will MCP help with APIs?**<br/>
 A: Start with [this post by Angie Jones](/blog/2025/02/17/agentic-ai-mcp/#mcp-ecosystem). MCP provides context about your API, to give AI Agents more context and awareness of the capabilities of your API endpoints and responses. This can help the Agent understand the intent of the request, and dynamically invoke (or "call") to underlying API endpoint, handle data transformation, and return a response. No more manually writing the code, response validators, error handlers, and so on!
 
 Q: **What are some initial steps I can take as a developer to explore AI agents and MCP?**<br/>
-A: Start by researching the fundamental concepts, and use other existing MCP servers. We recommend starting with [Goose](/) to integrate an existing MCP server. We have a growing [listof tutorials](/docs/category/mcp-servers) to help you find some technologies like GitHub, PostgreSQL, Google Maps, and more. Once you feel comfortable with using MCP, you can start building your own MCP server for your own APIs.
+A: Start by researching the fundamental concepts, and use other existing MCP servers. We recommend starting with [Goose](/) to integrate an existing MCP server. We have a growing [list of tutorials](/docs/category/mcp-servers) to help you find some technologies like GitHub, PostgreSQL, Google Maps, and more. Once you feel comfortable with using MCP, you can start building your own MCP server for your own APIs.
 
 Q: **What about AI and MCP security?**<br/>
 A: AI agents can enhance security through better context awareness in interactions, but MCP is still relatively new, and requires [careful security evaluations](/blog/2025/03/26/mcp-security/). Your business and dev teams should thoroughly investigate MCP's capabilities to ensure you're building appropriate access control, and managing data privacy.
@@ -153,12 +153,12 @@ A: Your approach on this may vary depending on whether you're building your own 
 <head>
   <meta property="og:title" content="MCP Is Rewriting the Rules of API Integration" />
   <meta property="og:type" content="article" />
-  <meta property="og:url" content="https://block.github.io/goose/blog/2025/04/22/mcp-is-rewriting-the-rules-of-api-integration" />
+  <meta property="og:url" content="https://goose-docs.ai/blog/2025/04/22/mcp-is-rewriting-the-rules-of-api-integration" />
   <meta property="og:description" content="A developer's guide to modernizing API infrastructure with AI agents and Model Context Protocol. Learn about the benefits, integration strategies, and how to address security considerations." />
-  <meta property="og:image" content="https://block.github.io/goose/assets/images/cover-1e2153c66f3f0c92da7bbaafd240a9b4.png" />
+  <meta property="og:image" content="https://goose-docs.ai/assets/images/cover-1e2153c66f3f0c92da7bbaafd240a9b4.png" />
   <meta name="twitter:card" content="summary_large_image" />
-  <meta property="twitter:domain" content="block.github.io/goose" />
+  <meta property="twitter:domain" content="goose-docs.ai" />
   <meta name="twitter:title" content="MCP Is Rewriting the Rules of API Integration" />
   <meta name="twitter:description" content="A developer's guide to modernizing API infrastructure with AI agents and Model Context Protocol. Learn about the benefits, integration strategies, and how to address security considerations." />
-  <meta name="twitter:image" content="https://block.github.io/goose/assets/images/cover-1e2153c66f3f0c92da7bbaafd240a9b4.png" />
+  <meta name="twitter:image" content="https://goose-docs.ai/assets/images/cover-1e2153c66f3f0c92da7bbaafd240a9b4.png" />
 </head>

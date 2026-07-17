@@ -17,14 +17,14 @@ goose is designed to be forked and customized. You can create your own "distro" 
 | Bundle custom MCP extensions | Medium |
 | Modify system prompts | Low |
 | Customize desktop branding (icons, names, colors) | Medium |
-| Build a new UI via REST API or ACP | High |
+| Build a new UI via ACP | High |
 | Create guided workflows with recipes | Low |
 
 ## Getting started
 
 The full guide lives in the repo root since you'll need to work at the code level to build a custom distribution:
 
-👉 **[CUSTOM_DISTROS.md](https://github.com/block/goose/blob/main/CUSTOM_DISTROS.md)**
+👉 **[CUSTOM_DISTROS.md](https://github.com/aaif-goose/goose/blob/main/CUSTOM_DISTROS.md)**
 
 It covers:
 
@@ -32,7 +32,7 @@ It covers:
 - **Configuration-only customization** — environment variables, `config.yaml`, `init-config.yaml`
 - **Extension bundling** — adding MCP servers as built-in extensions or via recipes
 - **Custom branding** — replacing icons, app names, system prompts
-- **Building new interfaces** — integrating via the REST API or Agent Client Protocol (ACP)
+- **Building new interfaces** — integrating with `goose serve` or `goose acp` over Agent Client Protocol (ACP)
 - **Custom AI providers** — declarative JSON providers or implementing the Provider trait
 - **Recipes & subagents** — distributing preconfigured workflows
 - **Licensing & contribution guidance** — staying compliant with Apache 2.0
@@ -53,4 +53,4 @@ GOOSE_PROVIDER: ollama
 GOOSE_MODEL: qwen3-coder:latest
 ```
 
-See the [full guide](https://github.com/block/goose/blob/main/CUSTOM_DISTROS.md) for more scenarios including corporate API key distribution, audience-specific builds, and custom UIs.
+See the [full guide](https://github.com/aaif-goose/goose/blob/main/CUSTOM_DISTROS.md) for more scenarios including corporate API key distribution, audience-specific builds, and custom UIs.

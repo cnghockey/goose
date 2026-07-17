@@ -29,16 +29,17 @@ It just means the change was too large for a first contribution. Start with some
 
 ### Issues
 
-If you spot a bug or have a concrete proposal for a feature, please open an issue. This shows the community and
-the maintainers the direction of your thinking.
+If you spot a bug, please open an issue. This shows the community and the maintainers the direction of your
+thinking.
 
 For bugs, describe how to reproduce the problem as clearly as possible. If the issue involves an interaction
 with an LLM, include a diagnostics report if possible.
 
 ### Discussions
 
-If you have an idea but are not yet sure how it should work, open a discussion instead. Discussions are a good
-place to explore design questions, alternatives, and whether something fits the goals of the project.
+Before opening a feature request or beginning implementation, please start with a discussion in the
+[goose-eng Discord channel](https://discord.com/channels/1287729918100246654/1514412780504088677). Discussions
+are a good place to explore design questions, alternatives, and whether something fits the goals of the project.
 
 If a change is large or touches multiple parts of the codebase, please start with a discussion before opening a PR.
 This helps us align on direction before you spend time implementing something.
@@ -71,7 +72,7 @@ can always reopen.
 ## Quick Responsible AI Tips
 
 There's no need to tell us you used AI in your work. You are contributing to an agent, it would be odd if 
-you had not. Our general thinking is, use AI anyway you want, but until the robot revolution comes, you
+you had not. Our general thinking is, use AI any way you want, but until the robot revolution comes, you
 are responsible for the final code. Before submitting a PR for review, make sure you have reviewed it yourself.
 We'll close any vibe coded submissions that obviously skip this step.
 
@@ -173,47 +174,44 @@ The app opens a window and displays first-time setup. After completing setup, go
 
 Make GUI changes in `ui/desktop`.
 
-### Regenerating the OpenAPI schema
+#### Troubleshooting: blank screen on `just run-ui`
 
-The file `ui/desktop/openapi.json` is automatically generated during the build.
-It is written by the `generate_schema` binary in `crates/goose-server`.
-To update the spec without starting the UI, run:
+If the app opens to a blank window (logs show `Cannot read properties of null (reading 'useRef')`), your `node_modules` is out of date and is loading two copies of React. Delete it and reinstall:
 
 ```
-just generate-openapi
+rm -rf ui/desktop/node_modules
+cd ui && pnpm install
 ```
 
-This command regenerates `ui/desktop/openapi.json` and then runs the UI's
-`generate-api` script to rebuild the TypeScript client from that spec.
-
-API changes should be made in the Rust source under `crates/goose-server/src/`.
+See #8757.
 
 ### Debugging
 
-To debug the Goose server, run it from an IDE. The configuration will depend on the IDE. The command to run is:
+To debug the external ACP backend, run it from an IDE. The configuration will depend on the IDE. The command to run is:
 
 ```
 export GOOSE_SERVER__SECRET_KEY=test
-cargo run --package goose-server --bin goosed -- agent   # or: `just run-server`
+cargo run --package goose-cli --bin goose -- serve --platform desktop --host 127.0.0.1 --port 3000
 ```
 
-The server listens on port `3000` by default; this can be changed by setting the
-`GOOSE_PORT` environment variable.
+The `debug-ui` recipe connects to `http://127.0.0.1:3000` by default. If the
+backend uses another port, set `GOOSE_PORT` when starting the UI, or set
+`GOOSE_EXTERNAL_BACKEND_URL` to the backend's HTTP base URL.
 
-Once the server is running, start a UI and connect it to the server by running:
+Once the backend is running, start a UI and connect it to the backend by running:
 
 ```
 just debug-ui
 ```
 
-The UI connects to the server started in the IDE, allowing breakpoints
-and stepping through the server code while interacting with the UI.
+The UI connects to the backend started in the IDE, allowing breakpoints
+and stepping through the backend code while interacting with the UI.
 
 ## Creating a fork
 
 To fork the repository:
 
-1. Go to https://github.com/block/goose and click “Fork” (top-right corner).
+1. Go to https://github.com/aaif-goose/goose and click “Fork” (top-right corner).
 2. This creates https://github.com/<your-username>/goose under your GitHub account.
 3. Clone your fork (not the main repo):
 
@@ -225,7 +223,7 @@ cd goose
 4. Add the main repository as upstream:
 
 ```
-git remote add upstream https://github.com/block/goose.git
+git remote add upstream https://github.com/aaif-goose/goose.git
 ```
 
 5. Create a branch in your fork for your changes:
@@ -250,7 +248,7 @@ git merge upstream/main
 git push origin my-feature-branch
 ```
 
-8. Open a Pull Request from your branch on your fork to block/goose’s main branch.
+8. Open a Pull Request from your branch on your fork to aaif-goose/goose’s main branch.
 
 ## Keeping Your Fork Up-to-Date
 
@@ -262,7 +260,7 @@ repository. This helps avoid conflicts and allows us to merge your pull requests
 1. **Add the Main Repository as a Remote** (Skip if you have already set this up):
 
    ```bash
-   git remote add upstream https://github.com/block/goose.git
+   git remote add upstream https://github.com/aaif-goose/goose.git
    ```
 
 2. **Fetch the Latest Changes from the Main Repository**:
@@ -346,19 +344,9 @@ Then you can view your traces at http://localhost:3000
 
 This project follows the [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) specification for PR titles. Conventional Commits make it easier to understand the history of a project and facilitate automation around versioning and changelog generation.
 
-[issues]: https://github.com/block/goose/issues
+[issues]: https://github.com/aaif-goose/goose/issues
 [hermit]: https://cashapp.github.io/hermit/
 [just]: https://github.com/casey/just?tab=readme-ov-file#installation
-
-## Developer Certificate of Origin
-
-This project requires a [Developer Certificate of Origin](https://en.wikipedia.org/wiki/Developer_Certificate_of_Origin) sign-offs on all commits. This is a statement indicating that you are allowed to make the contribution and that the project has the right to distribute it under its license. When you are ready to commit, use the `--signoff` or `-s` flag to attach the sign-off to your commit.
-
-```
-git commit --signoff ...
-# OR
-git commit -s ...
-```
 
 ## Other Ways to Contribute
 
@@ -366,7 +354,7 @@ There are numerous ways to be an open source contributor and contribute to goose
 
 - **Stars on GitHub:** If you resonate with our project and find it valuable, consider starring our goose on GitHub! 🌟
 - **Ask Questions:** Your questions not only help us improve but also benefit the community. If you have a question, don't hesitate to ask it on [Discord](https://discord.gg/goose-oss).
-- **Give Feedback:** Have a feature you want to see or encounter an issue with goose, [click here to open an issue](https://github.com/block/goose/issues/new/choose), [start a discussion](https://github.com/block/goose/discussions) or tell us on Discord.
+- **Give Feedback:** Have a feature you want to see or encounter an issue with goose, [click here to open an issue](https://github.com/aaif-goose/goose/issues/new/choose), [start a discussion](https://github.com/aaif-goose/goose/discussions) or tell us on Discord.
 - **Participate in Community Events:** We host a variety of community events and livestreams on Discord every month, ranging from workshops to brainstorming sessions. You can subscribe to our [events calendar](https://calget.com/c/t7jszrie) or follow us on [social media](https://linktr.ee/goose_oss) to stay in touch.
 - **Improve Documentation:** Good documentation is key to the success of any project. You can help improve the quality of our existing docs or add new pages.
 - **Help Other Members:** See another community member stuck? Or a contributor blocked by a question you know the answer to? Reply to community threads or do a code review for others to help.

@@ -1,95 +1,106 @@
 ---
-title: Sats4AI - Bitcoin-Powered AI Tools
-description: Use Bitcoin Lightning to pay for 33+ AI services directly from goose agents — no signup required.
+title: Sats4AI Extension
+description: Add Sats4AI MCP Server as a goose Extension
 ---
 
-# Sats4AI MCP Server
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+import CLIExtensionInstructions from '@site/src/components/CLIExtensionInstructions';
+import GooseDesktopInstaller from '@site/src/components/GooseDesktopInstaller';
 
-Sats4AI is a remote MCP server providing 33+ AI services (image generation, video, audio, transcription, translation, SMS, email, phone calls, and more) that agents can call by paying per request with Bitcoin Lightning micropayments.
+This tutorial covers how to add the [Sats4AI MCP Server](https://github.com/cnghockey/sats4ai-mcp-server) as a goose extension to give goose access to 33+ paid AI services — image generation, video, text-to-speech, transcription, translation, OCR, file conversion, SMS, email, and phone calls. Each request is paid with a Bitcoin Lightning micropayment. No API keys, no accounts, no sign-up.
 
-**No API keys. No accounts. No KYC.** Just a Lightning wallet.
+:::tip Quick Install
+<Tabs groupId="interface">
+  <TabItem value="ui" label="goose Desktop" default>
+  [Launch the installer](goose://extension?type=streamable_http&url=https%3A%2F%2Fsats4ai.com%2Fapi%2Fmcp&id=sats4ai&name=Sats4AI&description=Bitcoin-powered%20AI%20tools%20paid%20per%20request%20with%20Lightning)
+  </TabItem>
+  <TabItem value="cli" label="goose CLI">
+  Use `goose configure` to add a `Remote Extension (Streaming HTTP)` extension type with:
 
-## Installation
+  **Endpoint URL**
 
-### Quick Install
+  ```
+  https://sats4ai.com/api/mcp
+  ```
 
-```bash
-npm install -g sats4ai-mcp
-```
+  </TabItem>
+</Tabs>
 
-### Claude Desktop
+**Required Setup**
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+No API keys or environment variables. You need a Bitcoin Lightning wallet (such as Alby, Phoenix, or Breez) to pay the per-request invoices.
+:::
 
-```json
-{
-  "mcpServers": {
-    "sats4ai": {
-      "command": "npx",
-      "args": ["sats4ai-mcp"],
-      "type": "stdio"
-    }
-  }
-}
-```
+## Configuration
 
-### goose
+<Tabs groupId="interface">
+  <TabItem value="ui" label="goose Desktop" default>
 
-The server is available as a remote HTTP endpoint:
+    <GooseDesktopInstaller
+      extensionId="sats4ai"
+      extensionName="Sats4AI"
+      description="Bitcoin-powered AI tools paid per request with Lightning"
+      type="http"
+      url="https://sats4ai.com/api/mcp"
+    />
 
-```json
-{
-  "mcpServers": {
-    "sats4ai": {
-      "url": "https://sats4ai.com/api/mcp",
-      "type": "streamable_http"
-    }
-  }
-}
-```
+  </TabItem>
+  <TabItem value="cli" label="goose CLI">
 
-## How It Works
+    <CLIExtensionInstructions
+      name="sats4ai"
+      description="Bitcoin-powered AI tools paid per request with Lightning"
+      type="http"
+      url="https://sats4ai.com/api/mcp"
+      timeout={300}
+    />
 
-1. **Agent calls a tool** (e.g., `generate_image`)
-2. **Server returns an L402 challenge** (HTTP 402) with a payment request
-3. **Agent pays via WebLN or L402 library** (microtransaction, typically <100 sats)
-4. **Server executes the task** and returns the result
+  </TabItem>
+</Tabs>
 
-## Pricing
+## How Payments Work
 
-| Service | Model | Cost |
-|---------|-------|------|
-| Image Gen | Grok Imagine | 50 sats |
-| Video Gen | Kling v3 | 200 sats |
-| TTS (50 chars) | OmniVoice | 10 sats |
-| Transcription (1 min) | Mistral | 5 sats |
-| Translation (100 chars) | Qwen | 1 sat |
-| SMS | Telnyx | 2 sats |
+Sats4AI prices every service in satoshis (1 sat = 1/100,000,000 BTC). A typical flow:
 
-Live pricing and tool catalog: https://sats4ai.com/api/mcp/discovery
+1. goose calls a tool, for example `translate_text`
+2. The server responds with a Lightning invoice and a `payment_id`
+3. You pay the invoice from any Lightning wallet (most tools cost 1–200 sats, a fraction of a cent to a few cents)
+4. goose retries the call with the `payment_id` and receives the result
 
-## Tools
+If a service fails after payment, the server returns an LNURL-withdraw refund link automatically.
 
-- **Image**: generate_image, edit_image, remove_background, upscale_image, restore_face
-- **Video**: generate_video, animate_image
-- **Audio**: transcribe_audio, translate_text, synthesize_speech
-- **Communication**: send_sms, send_email, place_call, send_fax
-- **Document**: extract_document, extract_receipt, convert_pdf
+Live tool catalog with current pricing: [sats4ai.com/api/mcp/discovery](https://sats4ai.com/api/mcp/discovery)
 
-## Getting Started
+## Example Usage
 
-1. Install the MCP server
-2. Configure goose to use https://sats4ai.com/api/mcp
-3. Ask your agent to generate an image
-4. Your wallet will prompt for payment (~50 sats)
-5. Agent receives the result
+Translate a paragraph without any API key setup.
 
-## Documentation
+### goose Prompt
 
-- **Full API docs**: https://sats4ai.com/api/l402
-- **GitHub**: https://github.com/cnghockey/sats4ai-mcp-server
-- **Contact**: sats4ai@gmail.com
+> _Translate "Good morning, how are you today?" into French using Sats4AI._
 
----
+### goose Output
 
-**Sats4AI** — Payment is authorization. No login. No KYC. Just Bitcoin.
+:::note Desktop
+
+I'll use the Sats4AI translate tool for this.
+
+The server returned a Lightning invoice for 1 sat. After payment was confirmed, here is the translation:
+
+**"Bonjour, comment allez-vous aujourd'hui ?"**
+
+Total cost: 1 sat.
+
+:::
+
+## Available Tools
+
+- **Image**: generation, editing, background removal, upscaling, face restoration
+- **Video**: text-to-video, image animation, subtitles
+- **Audio**: text-to-speech (600+ languages), transcription, voice cloning
+- **Text**: translation (119+ languages), chat models, document Q&A
+- **Documents**: OCR, receipt extraction, PDF/file conversion, EPUB-to-audiobook
+- **Communication**: SMS, email, fax, AI phone calls
+
+Full documentation: [sats4ai.com/mcp](https://sats4ai.com/mcp)

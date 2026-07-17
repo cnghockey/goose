@@ -1,6 +1,6 @@
 ---
 title: Sats4AI - Bitcoin-Powered AI Tools
-description: Use Bitcoin Lightning to pay for 33+ AI services directly from Goose agents — no signup required.
+description: Use Bitcoin Lightning to pay for 33+ AI services directly from goose agents — no signup required.
 ---
 
 # Sats4AI MCP Server
@@ -33,7 +33,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 }
 ```
 
-### Goose
+### goose
 
 The server is available as a remote HTTP endpoint:
 
@@ -42,7 +42,7 @@ The server is available as a remote HTTP endpoint:
   "mcpServers": {
     "sats4ai": {
       "url": "https://sats4ai.com/api/mcp",
-      "type": "sse"
+      "type": "streamable_http"
     }
   }
 }
@@ -79,7 +79,7 @@ Live pricing and tool catalog: https://sats4ai.com/api/mcp/discovery
 ## Getting Started
 
 1. Install the MCP server
-2. Configure Goose to use https://sats4ai.com/api/mcp
+2. Configure goose to use https://sats4ai.com/api/mcp
 3. Ask your agent to generate an image
 4. Your wallet will prompt for payment (~50 sats)
 5. Agent receives the result

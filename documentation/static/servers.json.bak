@@ -802,18 +802,10 @@
     "description": "Discover nearby restaurants, browse menus, and place takeout orders through natural conversation. Sellers are US-based.",
     "type": "streamable-http",
     "url": "https://connect.squareup.com/v2/mcp/neighborhood",
-,
-{
-  "id": "sats4ai",
-  "name": "Sats4AI",
-  "description": "Bitcoin-powered AI tools marketplace. 33+ services (image generation, video, audio, OCR, translation, SMS, email, calls) paid per request with Lightning micropayments. No API keys, no accounts, no KYC.",
-  "url": "https://sats4ai.com/api/mcp",
-  "link": "https://github.com/cnghockey/sats4ai-mcp-server",
-  "installation_notes": "Add https://sats4ai.com/api/mcp as a remote HTTP extension. No setup required — just a Lightning wallet to pay for services.",
-  "is_builtin": false,
-  "endorsed": false,
-  "environmentVariables": [],
-  "type": "streamable-http"
-}
-
+    "link": "",
+    "installation_notes": "No local setup required. This extension connects to a remote service. Use the install button or run the command below.",
+    "is_builtin": false,
+    "endorsed": true,
+    "environmentVariables": []
+  }
 ]
